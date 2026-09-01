@@ -232,6 +232,36 @@ expect_dml "CAN book a walk-in appointment" "$asst" \
 expect_dml "cannot delete an appointment (admin only)" "$asst" \
   "delete from public.appointments where id='$A2' returning id" 0
 
+print "\n── book_walk_in (atomicity) ───────────────────────────────────"
+expect_dml "books patient + appointment in one call" "$asst" \
+  "select public.book_walk_in(
+     '$DENTAL', 'Atomic One', '09171112221',
+     '$DR_SANTOS', 'Teeth Cleaning', now() + interval '90 days') as id" 1
+# The point of the function: a losing race must leave no orphan chart behind.
+expect_err "double-booked slot is rejected" \
+  "begin;
+   $asst
+   select public.book_walk_in(
+     '$DENTAL', 'Atomic Two', '09171112222', '$DR_SANTOS', 'Teeth Cleaning',
+     (select scheduled_at from public.appointments where id = '$A2'));
+   rollback;"
+expect_eq "…and rolled the patient row back with it" \
+  "select count(*) from public.patients where full_name = 'Atomic Two';" 0
+expect_err "blank name is rejected before any write" \
+  "$asst select public.book_walk_in('$DENTAL','   ','09171112223',
+     '$DR_SANTOS','Teeth Cleaning', now() + interval '91 days');"
+expect_eq "…leaving no partial row" \
+  "select count(*) from public.patients where phone = '09171112223';" 0
+# SECURITY INVOKER means the caller's own RLS still applies inside the body.
+expect_err "assistant cannot book into a clinic they do not staff" \
+  "$asst select public.book_walk_in('$OPTO','Wrong Clinic','09171112224',
+     '$DR_BAUTISTA','Eye Examination', now() + interval '92 days');"
+expect_eq "…and created no patient there either" \
+  "select count(*) from public.patients where full_name = 'Wrong Clinic';" 0
+expect_err "a patient cannot call it at all" \
+  "$juan select public.book_walk_in('$DENTAL','Sneaky','09171112225',
+     '$DR_SANTOS','Teeth Cleaning', now() + interval '93 days');"
+
 print "\n── RLS · cross-clinic isolation ───────────────────────────────"
 expect_eq "dental staff cannot see the pedia-only patient Lisa" \
   "$asst select count(*) from public.patients
