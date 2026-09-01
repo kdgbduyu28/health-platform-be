@@ -1,0 +1,11 @@
+.DS_Store
+
+# Supabase CLI local state
+supabase/.branches
+supabase/.temp
+supabase/.env
+
+# Secrets — the service role key must never be committed
+.env
+.env.*
+!.env.example
