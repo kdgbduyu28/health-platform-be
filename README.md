@@ -1,22 +1,23 @@
 # health-platform-be
 
 Supabase backend for [health-platform-fe](../health-platform-fe) — a Flutter
-Melos workspace with four apps (patient, doctor, assistant, admin) running three
-clinic flavors (dental, optometry, pediatrics).
+Melos workspace with four apps (patient, doctor, assistant, admin) serving any
+number of clinics.
 
 There is no custom server. This repo is the database: schema migrations, Row
-Level Security policies, and seed data. The apps talk to Supabase directly
-through `supabase_flutter`.
+Level Security policies, a handful of database functions, and seed data. The
+apps talk to Supabase directly through `supabase_flutter`.
 
-## One project, four apps, three clinics
+## One project, four apps, many clinics
 
 A Supabase *project* is one Postgres database + one auth instance + one API URL.
-It is not per client app:
 
-- **All four Flutter apps** connect to this single project. They differ by the
-  role on the signed-in user's profile, not by endpoint.
-- **All three clinic flavors** live in the same database as rows in `clinics`.
-  Isolation is enforced by RLS, not by separate projects.
+- **All four apps** connect to this one project. A build decides only *which
+  app* it is; *which clinic* it shows comes from whoever signs in.
+- **Every clinic is a tenant row** in `clinics`. D-Touch Dental Clinic is one
+  tenant. Isolation between tenants is enforced by RLS, not by separate
+  projects, and onboarding another clinic is data, not a release — see
+  [docs/onboarding.md](docs/onboarding.md).
 
 So the whole platform is **1 active project**. The free tier allows 2, which
 leaves one spare — use it for a staging project.
@@ -36,42 +37,91 @@ Free tier limits worth knowing: 500 MB database, 1 GB file storage, 5 GB egress,
 ```
 supabase/
   migrations/
-    20260817120000_init_schema.sql   tables, enums, constraints, triggers
-    20260817120100_rls_policies.sql  private helpers + every RLS policy
-  seed.sql                           MockData ported to SQL, re-runnable
+    20260817120000_init_schema.sql            tables, enums, constraints, triggers
+    20260817120100_rls_policies.sql           private helpers + the original policies
+    20260818090000_harden_trigger_functions.sql
+    20260818100000_dedupe_appointment_fks.sql
+    20260901120000_book_walk_in_rpc.sql
+    20260914120000_clinics_as_tenants.sql     verticals as data, tenant config columns
+    20260914120100_person_chart_split.sql     persons + one chart per clinic
+    20260914120200_staff_across_clinics.sql   roles move onto memberships
+    20260914120300_tenant_scoped_reads.sql    clinics/doctors/services scoped to members
+    20260914120400_onboarding_rpcs.sql        join_clinic, invite_staff, admin self-service
+  seed.sql                                    four demo tenants, re-runnable
+  dev/
+    create_demo_users.sql                     demo accounts wired to the seed
+    provision_clinic.sql                      onboard a real clinic
   tests/
-    run.sh                           throwaway cluster → migrate → seed → test
-    rls_test.sh                      69 behavioural checks
-    supabase_shim.sql                test-only stubs for Supabase's auth schema
+    run.sh                                    throwaway cluster → migrate → seed → test
+    rls_test.sh                               164 behavioural checks
+    supabase_shim.sql                         test-only stubs for Supabase's auth schema
+docs/
+  onboarding.md                               runbook for adding a clinic client
 ```
+
+The first five migrations built a three-clinic demo. The `20260914…` set turns
+it into a multi-tenant platform; each file's header explains the problem it
+fixes, and each leaves the database in a working state on its own.
 
 ## Schema
 
 | Table | Purpose |
 |---|---|
-| `clinics` | The three tenants. `type` is the `clinic_type` enum. |
-| `profiles` | 1:1 with `auth.users`. Holds the `app_role` that drives every RLS decision. |
-| `clinic_memberships` | Which clinics a staff member works at. Patients have no row. |
-| `services` | Per-clinic service catalogue with durations (was a hardcoded Dart list). |
-| `doctors` | Roster, specialty, `available_weekdays`, `available_time_slots`. |
-| `patients` | Charts. `profile_id` is nullable so assistants can register walk-ins with no account. |
+| `clinic_types` | The verticals (dental, optometry, pedia, …). A new one is an `INSERT`. |
+| `clinics` | The tenants. Name, slug, vertical, brand colour, logo, join code, `is_active`. |
+| `profiles` | 1:1 with `auth.users`. An account and nothing more — no role. |
+| `clinic_memberships` | Staff: which clinics an account works at, and **its role at each one**. |
+| `services` | Per-clinic service catalogue with durations. |
+| `doctors` | Per-clinic roster. The same account may be on several clinics' rosters. |
+| `persons` | Who someone is: name, phone, email, DOB, optional account link. One per human. |
+| `patients` | A **chart**: one per (person, clinic). Holds the clinical notes. |
 | `appointments` | The core table. `service_name` snapshots the service at booking time so renaming a service never rewrites history. |
 
 Integrity is declarative wherever possible:
 
 - **No double-booking** — a partial unique index on `(doctor_id, scheduled_at)`
   excluding cancelled rows, so a freed slot can be rebooked.
-- **No cross-clinic bookings** — composite foreign keys mean an appointment's
-  doctor *and* service must belong to its clinic. No trigger needed.
-- `available_weekdays` is constrained to 1–7; service durations must be positive.
-- `appointments` is published to `supabase_realtime`, so the admin dashboard and
-  the assistant check-in screen can update live. RLS still applies to the
+- **No cross-clinic bookings** — composite foreign keys pin an appointment's
+  doctor, service *and chart* to its clinic. No trigger needed.
+- **One chart per person per clinic**, and a chart can never move to another
+  person or clinic (a trigger, since RLS cannot compare old and new rows).
+- `available_weekdays` is constrained to 1–7; service durations must be positive;
+  slugs, join codes and brand colours are format-checked.
+- `appointments` is published to `supabase_realtime`. RLS still applies to the
   realtime payloads.
+
+## Tenancy
+
+**Belonging.** Staff belong to a clinic through a membership, which carries
+their role *at that clinic*. Patients belong through a chart there. Nothing
+else grants anything: a fresh signup sees no clinics, no rosters and no
+records until they join one.
+
+**Seeing.** A user reads a clinic — its roster, its catalogue, its charts and
+appointments — only if they belong to it. Two dental clinics on the platform
+cannot see each other's staff, services or patients.
+
+**Shared identity, private charts.** When a person is a patient at two clinics,
+both clinics can read their `persons` row (name, phone), because both need to
+contact them. Each clinic's chart, and the clinical notes on it, is visible
+only to that clinic.
+
+**Getting in.**
+
+- A patient joins with the clinic's code: `join_clinic` creates their chart.
+- A clinic admin adds staff with `invite_staff` (the person must already have
+  an account) and removes them with `remove_staff`.
+- The front desk registers walk-ins with `book_walk_in`.
+
+A walk-in who is already a patient elsewhere becomes a *new* person record at
+this clinic. Matching them across clinics would mean one clinic's front desk
+searching another clinic's patients, which is exactly what the model prevents.
+Merging duplicates is an operator task.
 
 ## Roles and access
 
-Four roles, matching the four apps. Every table is deny-by-default and `anon`
-gets nothing — all four apps require a signed-in user.
+Four roles, matching the four apps, each held **per clinic**. Every table is
+deny-by-default and `anon` gets nothing.
 
 | | patient | doctor | assistant | admin |
 |---|---|---|---|---|
@@ -80,31 +130,33 @@ gets nothing — all four apps require a signed-in user.
 | Book | self, `pending` only | clinic | clinic | clinic |
 | Confirm / complete | **no** | clinic | clinic | clinic |
 | Cancel own booking | yes | — | — | — |
-| Delete appointment | no | no | no | yes |
-| Patient charts | own only | treating clinic | treating clinic | treating clinic |
+| Delete appointment | no | no | no | clinic |
+| Charts | own (read) | clinic | clinic | clinic |
+| Person details | own | clinic's patients | clinic's patients | clinic's patients |
 | Register walk-in | — | — | yes | yes |
 | Doctor roster | read | read + own availability | read | write |
 | Services | read | read | read | write |
+| Clinic details, logo, colour, join code | — | — | — | write |
+| Staff | — | — | — | invite, change role, remove |
 
-Two deliberate hard edges:
+"Clinic" always means *a clinic where the user holds that role*.
+
+Deliberate hard edges:
 
 - **Patients cannot confirm their own bookings.** Inserts are forced to
-  `status = 'pending'`; the only status change a patient may make is
-  `'cancelled'`.
-- **Nobody can escalate their own role.** `handle_new_user` always assigns
-  `'patient'` and deliberately ignores `raw_user_meta_data->>'role'`, because
-  that field is client-supplied — honouring it would let anyone sign up as an
-  admin. A trigger additionally blocks all role changes that do not come from
-  the service role key.
-
-### Why `patients.registered_clinic_id` exists
-
-A clinic's roster cannot be defined as "patients who have an appointment here" —
-a walk-in registered ten seconds ago has no appointment yet, so the assistant
-who just created the record could not read it back, and `.insert().select()`
-(which supabase-dart uses to return the inserted row) would fail outright.
-`registered_clinic_id` is the patient's home clinic; staff see their roster plus
-anyone referred in via an appointment.
+  `status = 'pending'`; the only change a patient may make is `'cancelled'`.
+  Nor can they write clinical notes on their own chart.
+- **A signup grants nothing.** `handle_new_user` creates a profile and ignores
+  everything in `raw_user_meta_data` except the display name. There is no role
+  on an account to escalate.
+- **Roles are per clinic.** An admin role granted by one clinic has no effect at
+  any other clinic the same account belongs to. (With the old account-wide
+  role, it did — see `20260914120200_staff_across_clinics.sql`.)
+- **Admins run their clinic, not the platform.** Column privileges let an admin
+  edit their clinic's name, logo, colour, contact details, timezone and join
+  code, but not its vertical, slug or `is_active`.
+- **Every clinic keeps at least one admin.** `invite_staff` and `remove_staff`
+  refuse to demote or remove the last one.
 
 ## Setup
 
@@ -114,47 +166,51 @@ At [supabase.com/dashboard](https://supabase.com/dashboard), create a project in
 the **Southeast Asia (Singapore)** region — closest to PH users. Save the
 database password.
 
-### 2. Apply the schema
+### 2. Apply the schema and seed
 
-**Dashboard** (no tooling needed): open the SQL Editor and run, in order:
-
-1. `supabase/migrations/20260817120000_init_schema.sql`
-2. `supabase/migrations/20260817120100_rls_policies.sql`
-3. `supabase/seed.sql`
-
-**Or the CLI** (`brew install supabase/tap/supabase`):
+With the CLI (`brew install supabase/tap/supabase`):
 
 ```sh
 supabase link --project-ref <your-project-ref>
-supabase db push          # applies both migrations
+supabase db push                       # applies every migration, in order
 psql "$DATABASE_URL" -f supabase/seed.sql
 ```
 
-### 3. Wire up a test user
+Or paste each migration into the SQL Editor in filename order, then `seed.sql`.
 
-The seed creates clinical records, not accounts. To sign in as Juan (the patient
-app's current user), sign up through the app or the dashboard, then link and
-promote with the **service role key** / SQL editor:
+### 3. Demo accounts
 
-```sql
--- Link a signed-up account to a seeded patient chart
-update public.patients
-   set profile_id = '<auth-user-uuid>'
- where id = '30000000-0000-0000-0000-000000000001';   -- Juan dela Cruz
-
--- Promote a user to clinic staff (role changes require the service role)
-update public.profiles set role = 'assistant' where id = '<auth-user-uuid>';
-insert into public.clinic_memberships (profile_id, clinic_id)
-values ('<auth-user-uuid>', '10000000-0000-0000-0000-000000000001');  -- dental
-
--- For a doctor, also link the roster row
-update public.doctors set profile_id = '<auth-user-uuid>'
- where id = '20000000-0000-0000-0000-000000000001';   -- Dr Maria Santos
+```sh
+supabase db query --linked "$(cat supabase/dev/create_demo_users.sql)"
 ```
 
-Seeded UUIDs are stable and traceable: `1…` clinics, `2…` doctors, `3…`
-patients, `4…` appointments, with ordinals following the Dart fixture order
-(doctor `…0004` is the mock's `o1`, Dr Bautista).
+Creates five accounts (password `demo1234`), including `admin@brightsmile.ph`,
+an admin at a second dental clinic, which is the quickest way to watch tenant
+isolation work: sign in as it and D-Touch does not exist.
+
+Seeded UUIDs are stable and traceable: `1…` clinics, `2…` doctors, `3…` charts,
+`4…` appointments, `5…` persons. Demo join codes are fixed: `DTOUCH26`,
+`CLEARV26`, `STARS026`, `BRIGHT26`.
+
+### 4. A real clinic
+
+Follow [docs/onboarding.md](docs/onboarding.md).
+
+### Upgrading a project that predates the tenancy migrations
+
+The `20260914…` migrations carry existing data over: each patient becomes a
+person with one chart per clinic they had appointments at (clinical notes stay
+on the original clinic's chart), self-signups with no clinic and no visits keep
+their identity but get no chart, and account-wide roles move onto memberships.
+Each migration's header describes exactly what it does to existing rows.
+
+For a project holding only demo data, a clean slate is simpler:
+`supabase db reset --linked`, then the seed and demo accounts. **That deletes
+everything in the project.**
+
+Either way, the deployed apps stop working the moment these migrations land —
+they read columns that no longer exist — until the matching frontend is
+deployed. Ship both together.
 
 ## Tests
 
@@ -162,10 +218,11 @@ patients, `4…` appointments, with ordinals following the Dart fixture order
 ./supabase/tests/run.sh
 ```
 
-Spins up a throwaway Postgres cluster, applies both migrations, seeds twice (to
-prove the seed is idempotent), and runs 69 checks — seed integrity, the
-declarative constraints, the auth bridge, and RLS from the perspective of a
-patient, a doctor, an assistant, and an anonymous caller.
+Spins up a throwaway Postgres cluster, applies every migration, seeds twice (to
+prove the seed is idempotent), and runs 164 checks: seed integrity, the
+declarative constraints, the auth bridge, RLS from the perspective of a patient,
+doctor, assistant, admin and anonymous caller, isolation between two dental
+tenants, and the onboarding functions.
 
 Needs a local Postgres 15+ (Postgres.app, or `brew install postgresql@17`).
 **No Docker and no Supabase CLI required** — `tests/supabase_shim.sql` stubs the
@@ -182,22 +239,3 @@ One thing the harness encodes, because it is easy to get wrong: an RLS-filtered
 `UPDATE`/`DELETE` does **not** raise — it silently matches zero rows. Only
 `INSERT` (and a failing `WITH CHECK`) raises. So denial of a write is asserted
 by row count via `RETURNING`, never by expecting an error.
-
-## Next: wiring the frontend
-
-Nothing in the Flutter workspace points here yet — it still reads
-`MockData`. The swap is contained to `packages/dependencies`:
-
-1. Add `supabase_flutter` to `packages/dependencies/pubspec.yaml`.
-2. Add `fromJson`/`toJson` to the models. Column names are snake_case
-   (`scheduled_at`, `full_name`, `clinic_type`), Dart fields are camelCase.
-3. Convert the Riverpod providers in
-   `packages/dependencies/lib/src/providers/` from synchronous `Provider`s over
-   `MockData` to `AsyncNotifierProvider`s over Supabase queries. Every read is
-   already funnelled through these, so no screen needs to change shape.
-4. Replace `currentPatientIdProvider` (hardcoded `'pt1'`) and
-   `currentDoctorProvider` (first doctor of the clinic type) with lookups
-   against the signed-in user's `profile_id`.
-5. `MockData`'s appointment dates are pinned to 2026-05-09, so they are already
-   stale. The seed uses relative dates instead; drop the fixture rather than
-   maintaining both.

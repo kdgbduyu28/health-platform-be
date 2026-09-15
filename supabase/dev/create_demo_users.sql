@@ -10,16 +10,18 @@
 -- up — but it means a freshly seeded project has nobody who can sign in, and
 -- every app opens onto an empty list.
 --
--- This script creates four accounts, one per app, and wires them to the seeded
--- records. It writes to auth.users directly rather than going through the
--- Admin API, which keeps the service_role secret out of this repo entirely.
+-- This script creates five accounts and wires them to the seeded records. It
+-- writes to auth.users directly rather than going through the Admin API, which
+-- keeps the service_role secret out of this repo entirely.
 --
--- All four share the password:  demo1234
+-- All five share the password:  demo1234
 --
---   juan@email.com       patient    → linked to Juan dela Cruz's chart
---   santos@clinic.ph     doctor     → linked to Dr Maria Santos (dental)
---   frontdesk@clinic.ph  assistant  → dental
---   admin@clinic.ph      admin      → all three clinics
+--   juan@email.com        patient    → Juan dela Cruz (charts at 3 clinics)
+--   santos@clinic.ph      doctor     → Dr Maria Santos, D-Touch
+--   frontdesk@clinic.ph   assistant  → D-Touch
+--   admin@clinic.ph       admin      → D-Touch, ClearVision, Little Stars
+--   admin@brightsmile.ph  admin      → BrightSmile only (the isolation demo:
+--                                      sign in as this and D-Touch is invisible)
 --
 -- Safe to re-run: existing accounts have their password reset to the one
 -- above rather than being duplicated.
@@ -105,53 +107,56 @@ $$;
 
 do $$
 declare
-  v_juan  uuid;
-  v_doc   uuid;
-  v_asst  uuid;
-  v_admin uuid;
+  v_juan   uuid;
+  v_doc    uuid;
+  v_asst   uuid;
+  v_admin  uuid;
+  v_bright uuid;
   c_dental constant uuid := '10000000-0000-0000-0000-000000000001';
   c_opto   constant uuid := '10000000-0000-0000-0000-000000000002';
   c_pedia  constant uuid := '10000000-0000-0000-0000-000000000003';
+  c_bright constant uuid := '10000000-0000-0000-0000-000000000004';
 begin
   -- Creating the auth user fires handle_new_user, which inserts the profile.
-  v_juan  := pg_temp.ensure_user('juan@email.com',      'demo1234', 'Juan dela Cruz');
-  v_doc   := pg_temp.ensure_user('santos@clinic.ph',    'demo1234', 'Maria Santos');
-  v_asst  := pg_temp.ensure_user('frontdesk@clinic.ph', 'demo1234', 'Front Desk');
-  v_admin := pg_temp.ensure_user('admin@clinic.ph',     'demo1234', 'Clinic Admin');
+  v_juan   := pg_temp.ensure_user('juan@email.com',       'demo1234', 'Juan dela Cruz');
+  v_doc    := pg_temp.ensure_user('santos@clinic.ph',     'demo1234', 'Maria Santos');
+  v_asst   := pg_temp.ensure_user('frontdesk@clinic.ph',  'demo1234', 'Front Desk');
+  v_admin  := pg_temp.ensure_user('admin@clinic.ph',      'demo1234', 'Clinic Admin');
+  v_bright := pg_temp.ensure_user('admin@brightsmile.ph', 'demo1234', 'BrightSmile Admin');
 
-  -- Every signup lands as 'patient'; promoting is a service-role action, which
-  -- is what this connection is. Juan stays a patient.
-  update public.profiles set role = 'doctor'    where id = v_doc;
-  update public.profiles set role = 'assistant' where id = v_asst;
-  update public.profiles set role = 'admin'     where id = v_admin;
-
-  -- Link the accounts to their clinical records.
-  update public.patients set profile_id = v_juan
-   where id = '30000000-0000-0000-0000-000000000001';   -- Juan dela Cruz
-  update public.doctors  set profile_id = v_doc
+  -- A signup grants nothing. Patients get access through a chart (their person
+  -- record, linked below); staff through a membership, which carries the role
+  -- for that one clinic. Linking a person to an account is a service-role
+  -- action, which is what this connection is.
+  update public.persons set profile_id = v_juan
+   where id = '50000000-0000-0000-0000-000000000001';   -- Juan dela Cruz
+  update public.doctors set profile_id = v_doc
    where id = '20000000-0000-0000-0000-000000000001';   -- Dr Maria Santos
 
-  -- Staff need a membership row; without one is_clinic_staff() is false and
-  -- they see nothing at all.
-  insert into public.clinic_memberships (profile_id, clinic_id) values
-    (v_doc,   c_dental),
-    (v_asst,  c_dental),
-    (v_admin, c_dental),
-    (v_admin, c_opto),
-    (v_admin, c_pedia)
-  on conflict do nothing;
+  insert into public.clinic_memberships (profile_id, clinic_id, role) values
+    (v_doc,    c_dental, 'doctor'),
+    (v_asst,   c_dental, 'assistant'),
+    (v_admin,  c_dental, 'admin'),
+    (v_admin,  c_opto,   'admin'),
+    (v_admin,  c_pedia,  'admin'),
+    (v_bright, c_bright, 'admin')
+  on conflict (profile_id, clinic_id) do update set role = excluded.role;
 end;
 $$;
 
-select p.role,
-       u.email,
+select u.email,
        p.full_name,
-       (select count(*) from public.clinic_memberships m
-         where m.profile_id = p.id) as clinics,
+       coalesce(
+         (select string_agg(c.name || ' (' || m.role || ')', ', ' order by c.name)
+            from public.clinic_memberships m
+            join public.clinics c on c.id = m.clinic_id
+           where m.profile_id = p.id),
+         '—') as staff_at,
        (select count(*) from public.patients pt
-         where pt.profile_id = p.id) as patient_chart,
+          join public.persons pe on pe.id = pt.person_id
+         where pe.profile_id = p.id) as charts,
        (select count(*) from public.doctors d
-         where d.profile_id = p.id) as doctor_row
+         where d.profile_id = p.id) as roster_rows
   from public.profiles p
   join auth.users u on u.id = p.id
- order by p.role;
+ order by u.email;
