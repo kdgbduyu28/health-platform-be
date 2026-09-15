@@ -181,28 +181,38 @@ on conflict (id) do update set
 
 -- ── Patient charts ──────────────────────────────────────────────────────────
 -- One per (person, clinic). Maria has charts at both dental tenants, each with
--- notes the other must never see — the isolation tests lean on exactly this.
+-- a medical note the other must never see — the isolation tests lean on
+-- exactly this.
 
-insert into public.patients (id, person_id, clinic_id, medical_notes) values
+insert into public.patients (id, person_id, clinic_id) values
   -- D-Touch
-  ('30000000-0000-0000-0000-000000000001', '50000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001', null),
-  ('30000000-0000-0000-0000-000000000002', '50000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001', 'Allergic to latex.'),
-  ('30000000-0000-0000-0000-000000000005', '50000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000001', null),
-  ('30000000-0000-0000-0000-00000000000a', '50000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001', null),
+  ('30000000-0000-0000-0000-000000000001', '50000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001'),
+  ('30000000-0000-0000-0000-000000000002', '50000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001'),
+  ('30000000-0000-0000-0000-000000000005', '50000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000001'),
+  ('30000000-0000-0000-0000-00000000000a', '50000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001'),
   -- ClearVision
-  ('30000000-0000-0000-0000-000000000007', '50000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000002', null),
-  ('30000000-0000-0000-0000-000000000009', '50000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000002', null),
-  ('30000000-0000-0000-0000-00000000000b', '50000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000002', null),
-  ('30000000-0000-0000-0000-00000000000c', '50000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000002', null),
+  ('30000000-0000-0000-0000-000000000007', '50000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000002'),
+  ('30000000-0000-0000-0000-000000000009', '50000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000002'),
+  ('30000000-0000-0000-0000-00000000000b', '50000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000002'),
+  ('30000000-0000-0000-0000-00000000000c', '50000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000002'),
   -- Little Stars
-  ('30000000-0000-0000-0000-000000000003', '50000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000003', null),
-  ('30000000-0000-0000-0000-000000000004', '50000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000003', null),
-  ('30000000-0000-0000-0000-000000000006', '50000000-0000-0000-0000-000000000006', '10000000-0000-0000-0000-000000000003', null),
-  ('30000000-0000-0000-0000-000000000008', '50000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000003', null),
+  ('30000000-0000-0000-0000-000000000003', '50000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000003'),
+  ('30000000-0000-0000-0000-000000000004', '50000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000003'),
+  ('30000000-0000-0000-0000-000000000006', '50000000-0000-0000-0000-000000000006', '10000000-0000-0000-0000-000000000003'),
+  ('30000000-0000-0000-0000-000000000008', '50000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000003'),
   -- BrightSmile
-  ('30000000-0000-0000-0000-00000000000d', '50000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000004', 'Considering implants; wants a second opinion.')
-on conflict (id) do update set
-  medical_notes = excluded.medical_notes;
+  ('30000000-0000-0000-0000-00000000000d', '50000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000004')
+on conflict (id) do nothing;
+
+-- ── Medical notes ───────────────────────────────────────────────────────────
+-- Clinicians only (20260915120000), kept off the chart row so the front desk
+-- can read the chart without reading these.
+
+insert into public.chart_notes (patient_id, clinic_id, body) values
+  ('30000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001', 'Allergic to latex.'),
+  ('30000000-0000-0000-0000-00000000000d', '10000000-0000-0000-0000-000000000004', 'Considering implants; wants a second opinion.')
+on conflict (patient_id) do update set
+  body = excluded.body;
 
 -- ── Appointments ────────────────────────────────────────────────────────────
 -- Three or four appointments today per original clinic, a few upcoming, a few
@@ -211,9 +221,9 @@ on conflict (id) do update set
 
 insert into public.appointments
   (id, clinic_id, patient_id, doctor_id, service_id, service_name,
-   scheduled_at, status, notes)
+   scheduled_at, status, patient_note)
 select v.id, v.clinic_id, v.patient_id, v.doctor_id, s.id, v.service_name,
-       v.scheduled_at, v.status, v.notes
+       v.scheduled_at, v.status, v.patient_note
 from (values
   -- ─ D-TOUCH ─
   ('40000000-0000-0000-0000-000000000001'::uuid,
@@ -237,11 +247,10 @@ from (values
   ('40000000-0000-0000-0000-000000000006', '10000000-0000-0000-0000-000000000001',
    '30000000-0000-0000-0000-000000000001', '20000000-0000-0000-0000-000000000001',
    'Teeth Cleaning', pg_temp.slot(-7, '09:00'), 'completed',
-   'Good oral hygiene. Follow-up in 6 months.'),
+   'Brush twice daily and floss. See you in 6 months.'),
   ('40000000-0000-0000-0000-000000000007', '10000000-0000-0000-0000-000000000001',
    '30000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000001',
-   'Dental X-Ray', pg_temp.slot(-11, '10:00'), 'completed',
-   'No cavities detected.'),
+   'Dental X-Ray', pg_temp.slot(-11, '10:00'), 'completed', null),
 
   -- ─ CLEARVISION ─
   ('40000000-0000-0000-0000-000000000008', '10000000-0000-0000-0000-000000000002',
@@ -258,8 +267,7 @@ from (values
    'Glaucoma Screening', pg_temp.slot(6, '11:00'), 'confirmed', null),
   ('40000000-0000-0000-0000-00000000000c', '10000000-0000-0000-0000-000000000002',
    '30000000-0000-0000-0000-000000000007', '20000000-0000-0000-0000-000000000004',
-   'Eye Examination', pg_temp.slot(-7, '09:00'), 'completed',
-   'Prescribed -2.50 OD, -2.75 OS. Recommend glasses.'),
+   'Eye Examination', pg_temp.slot(-7, '09:00'), 'completed', null),
 
   -- ─ LITTLE STARS ─
   ('40000000-0000-0000-0000-00000000000d', '10000000-0000-0000-0000-000000000003',
@@ -279,19 +287,28 @@ from (values
    'Development Screening', pg_temp.slot(12, '14:00'), 'confirmed', null),
   ('40000000-0000-0000-0000-000000000012', '10000000-0000-0000-0000-000000000003',
    '30000000-0000-0000-0000-000000000003', '20000000-0000-0000-0000-000000000007',
-   'Vaccination', pg_temp.slot(-14, '09:00'), 'completed',
-   'MMR vaccine administered. Next dose in 12 months.'),
+   'Vaccination', pg_temp.slot(-14, '09:00'), 'completed', null),
 
   -- ─ BRIGHTSMILE ─
   ('40000000-0000-0000-0000-000000000013', '10000000-0000-0000-0000-000000000004',
    '30000000-0000-0000-0000-00000000000d', '20000000-0000-0000-0000-00000000000a',
    'Dental Implant Consultation', pg_temp.slot(3, '10:00'), 'pending', null)
 ) as v(id, clinic_id, patient_id, doctor_id, service_name,
-       scheduled_at, status, notes)
+       scheduled_at, status, patient_note)
 left join public.services s
   on s.clinic_id = v.clinic_id and s.name = v.service_name
 on conflict (id) do update set
   scheduled_at = excluded.scheduled_at,
   status       = excluded.status,
-  notes        = excluded.notes,
+  patient_note = excluded.patient_note,
   service_id   = excluded.service_id;
+
+-- Consultation notes on the completed visits. Clinical, so clinicians only;
+-- the note to the patient on 40…06 above is the part Juan gets to read.
+insert into public.visit_notes (appointment_id, clinic_id, body) values
+  ('40000000-0000-0000-0000-000000000006', '10000000-0000-0000-0000-000000000001', 'Good oral hygiene. Follow-up in 6 months.'),
+  ('40000000-0000-0000-0000-000000000007', '10000000-0000-0000-0000-000000000001', 'No cavities detected.'),
+  ('40000000-0000-0000-0000-00000000000c', '10000000-0000-0000-0000-000000000002', 'Prescribed -2.50 OD, -2.75 OS. Recommend glasses.'),
+  ('40000000-0000-0000-0000-000000000012', '10000000-0000-0000-0000-000000000003', 'MMR vaccine administered. Next dose in 12 months.')
+on conflict (appointment_id) do update set
+  body = excluded.body;

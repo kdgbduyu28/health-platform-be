@@ -74,8 +74,10 @@ fixes, and each leaves the database in a working state on its own.
 | `services` | Per-clinic service catalogue with durations. |
 | `doctors` | Per-clinic roster. The same account may be on several clinics' rosters. |
 | `persons` | Who someone is: name, phone, email, DOB, optional account link. One per human. |
-| `patients` | A **chart**: one per (person, clinic). Holds the clinical notes. |
-| `appointments` | The core table. `service_name` snapshots the service at booking time so renaming a service never rewrites history. |
+| `patients` | A **chart**: one per (person, clinic). Belongs to that clinic forever. |
+| `appointments` | The core table. `service_name` snapshots the service at booking time so renaming a service never rewrites history. `patient_note` is what the doctor wants the patient to read. |
+| `chart_notes` | The standing medical note on a chart (allergies, conditions). Clinicians only. |
+| `visit_notes` | The consultation note on an appointment. Clinicians only. |
 
 Integrity is declarative wherever possible:
 
@@ -105,6 +107,14 @@ cannot see each other's staff, services or patients.
 both clinics can read their `persons` row (name, phone), because both need to
 contact them. Each clinic's chart, and the clinical notes on it, is visible
 only to that clinic.
+
+**Clinical notes, clinicians only.** Within a clinic, `chart_notes` and
+`visit_notes` are readable and writable by its doctors and admins — not by the
+front desk, and not by the patient. They are separate tables rather than
+columns because RLS filters rows, not columns: the front desk has to read the
+chart and the appointment, and the patient has to read their appointment. A
+patient reads only `appointments.patient_note`, which only a clinician can
+write (a guard trigger).
 
 **Getting in.**
 
@@ -145,7 +155,8 @@ Deliberate hard edges:
 
 - **Patients cannot confirm their own bookings.** Inserts are forced to
   `status = 'pending'`; the only change a patient may make is `'cancelled'`.
-  Nor can they write clinical notes on their own chart.
+  They cannot read or write clinical notes at all, only the `patient_note`
+  their doctor leaves on an appointment.
 - **A signup grants nothing.** `handle_new_user` creates a profile and ignores
   everything in `raw_user_meta_data` except the display name. There is no role
   on an account to escalate.

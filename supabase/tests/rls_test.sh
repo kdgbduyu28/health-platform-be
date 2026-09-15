@@ -68,6 +68,8 @@ PT_MARIA_BRIGHT='30000000-0000-0000-0000-00000000000d'  # …and at BrightSmile
 PT_LISA='30000000-0000-0000-0000-000000000006'          # Little Stars only
 A2='40000000-0000-0000-0000-000000000002'
 A4='40000000-0000-0000-0000-000000000004'
+A6='40000000-0000-0000-0000-000000000006'   # Juan, completed, carries a note to him
+A7='40000000-0000-0000-0000-000000000007'   # Maria, completed, has a visit note
 A_BRIGHT='40000000-0000-0000-0000-000000000013'
 WALKIN='5eeeeeee-0000-0000-0000-000000000001'
 
@@ -109,6 +111,13 @@ expect_eq "every appointment's chart is in its clinic" \
    where p.clinic_id <> a.clinic_id;" 0
 expect_eq "Juan holds one chart per clinic he has visited" \
   "select count(*) from public.patients where person_id='$PERSON_JUAN';" 3
+expect_eq "2 medical notes" "select count(*) from public.chart_notes;" 2
+expect_eq "4 visit notes"   "select count(*) from public.visit_notes;" 4
+expect_eq "no clinical text left on rows the front desk and patients read" \
+  "select count(*) from information_schema.columns
+   where table_schema='public'
+     and ((table_name='patients' and column_name='medical_notes')
+       or (table_name='appointments' and column_name='notes'));" 0
 
 print "\n── Declarative integrity ──────────────────────────────────────"
 expect_err "double-booking a doctor is rejected" \
@@ -227,10 +236,23 @@ expect_dml "CAN update his own phone" "$juan" \
   "update public.persons set phone='09990000000' where id='$PERSON_JUAN' returning id" 1
 expect_err "cannot re-point his person record at another account" \
   "$juan update public.persons set profile_id='$NEWBIE_AUTH' where id='$PERSON_JUAN';"
-expect_dml "cannot write clinical notes on his own chart" "$juan" \
-  "update public.patients set medical_notes='self-diagnosed' where id='$PT_JUAN' returning id" 0
-expect_dml "cannot touch another patient's chart" "$juan" \
-  "update public.patients set medical_notes='x' where id='$PT_MARIA' returning id" 0
+expect_eq "cannot read the medical note on his own chart" \
+  "$juan select count(*) from public.chart_notes;" 0
+expect_eq "cannot read the consultation notes on his own visits" \
+  "$juan select count(*) from public.visit_notes;" 0
+expect_eq "CAN read the note his doctor left for him" \
+  "$juan select patient_note from public.appointments where id='$A6';" \
+  "Brush twice daily and floss. See you in 6 months."
+expect_err "cannot write a medical note on his own chart" \
+  "$juan insert into public.chart_notes (patient_id,clinic_id,body) values ('$PT_JUAN','$DENTAL','self-diagnosed');"
+expect_dml "cannot touch another patient's medical note" "$juan" \
+  "update public.chart_notes set body='x' where patient_id='$PT_MARIA' returning patient_id" 0
+# Cancelling passes his RLS, so only the guard trigger stands in the way here.
+expect_err "cannot write himself a note from the doctor" \
+  "$juan update public.appointments set status='cancelled', patient_note='no charge' where id='$A4';"
+expect_err "…nor book with one attached" \
+  "$juan insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status,patient_note)
+   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Root Canal',now()+interval '64 days','pending','VIP');"
 expect_dml "cannot touch another person's details" "$juan" \
   "update public.persons set phone='x' where id='$PERSON_MARIA' returning id" 0
 expect_dml "cannot cancel someone else's appointment" "$juan" \
@@ -262,8 +284,12 @@ expect_eq "sees D-Touch's 7 appointments"   "$doc select count(*) from public.ap
 expect_eq "…and nothing outside D-Touch"    "$doc select count(distinct clinic_id) from public.appointments;" 1
 expect_eq "sees the 4 charts held at D-Touch" "$doc select count(*) from public.patients;" 4
 expect_eq "…and those 4 people's details" "$doc select count(*) from public.persons;" 4
-expect_eq "reads D-Touch's notes on Maria" \
-  "$doc select medical_notes from public.patients where id='$PT_MARIA';" "Allergic to latex."
+expect_eq "reads D-Touch's medical note on Maria" \
+  "$doc select body from public.chart_notes where patient_id='$PT_MARIA';" "Allergic to latex."
+expect_eq "reads D-Touch's 2 visit notes and no others" \
+  "$doc select count(*) from public.visit_notes;" 2
+expect_eq "cannot read BrightSmile's medical note on the same person" \
+  "$doc select count(*) from public.chart_notes where patient_id='$PT_MARIA_BRIGHT';" 0
 expect_eq "cannot see Maria's BrightSmile chart" \
   "$doc select count(*) from public.patients where id='$PT_MARIA_BRIGHT';" 0
 expect_eq "cannot see BrightSmile's roster" \
@@ -273,7 +299,22 @@ expect_eq "cannot see BrightSmile's services" \
 expect_dml "CAN confirm a pending appointment" "$doc" \
   "update public.appointments set status='confirmed' where id='$A2' returning id" 1
 expect_dml "CAN write consultation notes" "$doc" \
-  "update public.appointments set notes='Reviewed x-ray.' where id='$A2' returning id" 1
+  "insert into public.visit_notes (appointment_id,clinic_id,body)
+   values ('$A2','$DENTAL','Reviewed x-ray.') returning appointment_id" 1
+expect_dml "CAN revise one (upsert)" "$doc" \
+  "insert into public.visit_notes (appointment_id,clinic_id,body) values ('$A7','$DENTAL','Revised.')
+   on conflict (appointment_id) do update set body=excluded.body returning appointment_id" 1
+expect_dml "…and the write is stamped with its author, not a client value" \
+  "$doc insert into public.visit_notes (appointment_id,clinic_id,body,updated_by)
+   values ('$A2','$DENTAL','x','$ASST_AUTH');" \
+  "select 1 from public.visit_notes where appointment_id='$A2' and updated_by='$DOC_AUTH'" 1
+expect_dml "CAN keep a patient's medical note" "$doc" \
+  "insert into public.chart_notes (patient_id,clinic_id,body)
+   values ('$PT_JUAN','$DENTAL','Sensitive gums.') returning patient_id" 1
+expect_dml "CAN leave the patient a note" "$doc" \
+  "update public.appointments set patient_note='Avoid hot drinks for 24h.' where id='$A2' returning id" 1
+expect_err "cannot file a note on another clinic's appointment" \
+  "$doc insert into public.visit_notes (appointment_id,clinic_id,body) values ('$A_BRIGHT','$BRIGHT','x');"
 expect_dml "CAN maintain their own availability" "$doc" \
   "update public.doctors set available_weekdays='{1,2,3}' where id='$DR_SANTOS' returning id" 1
 expect_dml "cannot edit another doctor's availability" "$doc" \
@@ -290,6 +331,18 @@ expect_err "cannot register a walk-in (assistants and admins only)" \
 print "\n── RLS · assistant (front desk, D-Touch) ──────────────────────"
 expect_eq "sees D-Touch's 7 appointments" "$asst select count(*) from public.appointments;" 7
 expect_eq "sees D-Touch's 4 charts"       "$asst select count(*) from public.patients;" 4
+expect_eq "cannot read the medical notes on those charts" \
+  "$asst select count(*) from public.chart_notes;" 0
+expect_eq "cannot read consultation notes" "$asst select count(*) from public.visit_notes;" 0
+expect_err "cannot write a consultation note" \
+  "$asst insert into public.visit_notes (appointment_id,clinic_id,body) values ('$A2','$DENTAL','x');"
+expect_dml "cannot overwrite a medical note" "$asst" \
+  "update public.chart_notes set body='x' where patient_id='$PT_MARIA' returning patient_id" 0
+expect_err "cannot write the patient a note from the doctor" \
+  "$asst update public.appointments set patient_note='x' where id='$A2';"
+# The guard fires on a CHANGE to the note, not on its presence.
+expect_dml "CAN still update a visit that carries a doctor's note" "$asst" \
+  "update public.appointments set status='confirmed' where id='$A6' returning id" 1
 # The walk-in flow by hand: person first (no RETURNING), then the chart.
 expect_dml "CAN register a walk-in (person + chart) and read the chart back" \
   "$asst insert into public.persons (id,full_name,phone) values ('$WALKIN','Walk-in Test','09171110000');" \
@@ -354,6 +407,10 @@ expect_dml "cannot delete one at BrightSmile" "$dtadmin" \
   "delete from public.appointments where id='$A_BRIGHT' returning id" 0
 expect_dml "cannot edit BrightSmile's catalogue" "$dtadmin" \
   "update public.services set duration_minutes=999 where clinic_id='$BRIGHT' returning id" 0
+expect_eq "reads D-Touch's visit notes" "$dtadmin select count(*) from public.visit_notes;" 2
+expect_dml "…and CAN write a medical note" "$dtadmin" \
+  "insert into public.chart_notes (patient_id,clinic_id,body)
+   values ('$PT_JUAN','$DENTAL','Anxious patient.') returning patient_id" 1
 
 print "\n── RLS · two dental tenants (D-Touch vs BrightSmile) ──────────"
 expect_eq "BrightSmile's admin sees only their own clinic" "$bright select count(*) from public.clinics;" 1
@@ -361,11 +418,13 @@ expect_eq "…their own 1 appointment" "$bright select count(*) from public.appo
 expect_eq "…their own 1 doctor"      "$bright select count(*) from public.doctors;" 1
 expect_eq "…their own 3 services"    "$bright select count(*) from public.services;" 3
 expect_eq "…and only Maria's BrightSmile chart" "$bright select count(*) from public.patients;" 1
-expect_eq "reads BrightSmile's notes on Maria" \
-  "$bright select medical_notes from public.patients where id='$PT_MARIA_BRIGHT';" \
+expect_eq "reads BrightSmile's medical note on Maria" \
+  "$bright select body from public.chart_notes where patient_id='$PT_MARIA_BRIGHT';" \
   "Considering implants; wants a second opinion."
 expect_eq "cannot read D-Touch's chart on the same person" \
   "$bright select count(*) from public.patients where id='$PT_MARIA';" 0
+expect_eq "…nor D-Touch's medical note on her" \
+  "$bright select count(*) from public.chart_notes where patient_id='$PT_MARIA';" 0
 expect_eq "does see Maria's shared identity row (by design)" \
   "$bright select count(*) from public.persons where id='$PERSON_MARIA';" 1
 expect_eq "D-Touch's front desk cannot see BrightSmile's appointment" \
@@ -446,6 +505,10 @@ expect_err "an assistant cannot remove staff" \
 expect_dml "an admin CAN remove a doctor, which unlinks their roster row" \
   "$dtadmin do \$\$ begin perform public.remove_staff('$DENTAL','$DOC_AUTH'); end \$\$;" \
   "select id from public.doctors where profile_id='$DOC_AUTH'" 0
+expect_dml "…and ends their access to D-Touch's clinical notes" \
+  "$dtadmin do \$\$ begin perform public.remove_staff('$DENTAL','$DOC_AUTH'); end \$\$;
+   set request.jwt.claim.sub = '$DOC_AUTH';" \
+  "select appointment_id from public.visit_notes" 0
 
 print "\n── Clinic self-service (admin) ────────────────────────────────"
 expect_dml "an admin CAN rename their clinic" "$dtadmin" \
@@ -485,6 +548,8 @@ expect_eq "anon sees no clinics"      "$anon select count(*) from public.clinics
 expect_eq "anon sees no doctors"      "$anon select count(*) from public.doctors;" 0
 expect_eq "anon sees no persons"      "$anon select count(*) from public.persons;" 0
 expect_eq "anon sees no patients"     "$anon select count(*) from public.patients;" 0
+expect_eq "anon sees no medical notes" "$anon select count(*) from public.chart_notes;" 0
+expect_eq "anon sees no visit notes"  "$anon select count(*) from public.visit_notes;" 0
 expect_err "anon cannot insert an appointment" \
   "$anon insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at)
    values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Root Canal',now()+interval '80 days');"
