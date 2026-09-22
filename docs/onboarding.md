@@ -90,21 +90,10 @@ select id, 'Paolo Villanueva', 'Cosmetic Dentistry',
   from public.clinics where slug = 'brightsmile-dental-studio';
 ```
 
-A doctor who will use the **doctor app** also needs:
-
-1. an account (they sign up, like step 2);
-2. to be added as staff with the **Doctor** role (step 8);
-3. their roster row linked to that account:
-
-```sql
-update public.doctors d
-   set profile_id = p.id
-  from public.profiles p, public.clinics c
- where p.email = 'paolo@brightsmile.ph'
-   and c.slug  = 'brightsmile-dental-studio'
-   and d.clinic_id = c.id
-   and d.full_name = 'Paolo Villanueva';
-```
+A doctor who will use the **doctor app** then joins with a staff code (step 8).
+When the administrator approves them, they pick this roster row and it is
+linked to the doctor's account — no SQL. (Approving can also create a new
+roster row, but without working days or time slots, which are still SQL.)
 
 A doctor can be on several clinics' rosters with the same account.
 
@@ -122,18 +111,42 @@ stops working; joined patients are unaffected) or **turn it off** entirely.
 
 ## 8. Staff
 
-The administrator does this in **Clinic → Staff → Add**:
+**Doctors and assistants join with a staff code.** In the admin app,
+**Clinic → Staff requests → New code**:
 
-1. The staff member signs up in any app with their work email.
-2. The administrator adds that email with a role:
-   - **Assistant** — front desk: check-in, walk-ins, confirmations.
-   - **Doctor** — their own schedule and consultation notes.
-   - **Admin** — everything above, plus clinic settings and staff.
-3. The staff member taps **Try again** (or signs in again) in their app.
+1. Pick **Doctor** or **Assistant**, optionally note who it is for, and create
+   the code. One code per person: it works once and expires in 7 days.
+2. Give that person the code.
+3. They create an account in the doctor or assistant app, sign in, and enter
+   the code. That files a request; it grants nothing yet.
+4. The request appears under **Staff requests**, and the Clinic tab shows a
+   badge. **Approve** or **Decline**. Approving a doctor asks which roster row
+   is theirs (step 6), or creates one with their specialty.
+5. They tap **Check again** in their app.
+
+Unused codes can be cancelled from the same list. Roles:
+
+- **Assistant** — front desk: check-in, walk-ins, confirmations.
+- **Doctor** — their own schedule and consultation notes.
+
+**Admins are added by email**, by a full admin, in **Clinic → Staff → Add**:
+the person signs up in any app first, then the admin enters that email and
+picks **Admin**.
+
+- **Full admin** — everything: clinic settings, join code, staff, and other
+  admins.
+- **Branch admin** (the *Branch admin* switch) — everything at this clinic
+  *except* adding, changing or removing admins. They approve doctors and
+  assistants like any admin. A branch admin cannot be an admin at any other
+  clinic.
+
+A full admin can also add a doctor or assistant by email directly, skipping the
+code — but that does not link a doctor's roster row.
 
 Tapping a staff member changes their role; the remove icon takes their access
-away. A clinic always keeps at least one admin — the app will refuse to remove
-or demote the last one.
+away. Branch admins cannot change or remove admins. A clinic always keeps at
+least one **full** admin — the app refuses to remove, demote or branch-lock the
+last one.
 
 A role applies to this clinic only. Someone who is an admin here and a doctor
 elsewhere stays exactly that.
@@ -162,6 +175,17 @@ app sees this too. Tap **Try again** after fixing it.
 
 **"That clinic code is not valid."** The code was mistyped, rotated, or turned
 off — or the clinic is inactive. Codes ignore case and spaces.
+
+**"That staff code is not valid, has expired, or was already used."** Staff
+codes work once and for 7 days. Issue a new one. A patient join code is not a
+staff code.
+
+**"This code is for the Doctor app."** A doctor's code was entered in the
+assistant app, or the other way round.
+
+**Nobody receives the password reset email.** The project is still on
+Supabase's built-in mailer, which only delivers to the project's own team. See
+*Password reset emails* in the README.
 
 **The same patient appears twice.** They were registered as a walk-in and later
 joined with the code from their own account, which creates a separate person

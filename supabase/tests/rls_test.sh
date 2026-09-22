@@ -542,6 +542,182 @@ expect_err "an assistant cannot rotate the join code" \
 expect_err "BrightSmile's admin cannot rotate D-Touch's code" \
   "$bright select public.rotate_join_code('$DENTAL');"
 
+print "\n── Branch admins ──────────────────────────────────────────────"
+# From here on the checks commit, like the join_clinic ones above: an applicant
+# only gets as far as approval by going through each step for real.
+BRANCH_AUTH='aaaaaaaa-0000-0000-0000-000000000007'
+APPLICANT_AUTH='aaaaaaaa-0000-0000-0000-000000000008'
+APPLICANT2_AUTH='aaaaaaaa-0000-0000-0000-000000000009'
+expect_ok "create a branch admin and two applicants" \
+  "insert into auth.users (id,email,raw_user_meta_data) values
+     ('$BRANCH_AUTH','branch@dtouch.ph','{\"full_name\":\"Branch Admin\"}'),
+     ('$APPLICANT_AUTH','reyes@mail.com','{\"full_name\":\"Ana Reyes\"}'),
+     ('$APPLICANT2_AUTH','nurse@mail.com','{\"full_name\":\"Nora Cruz\"}');"
+branch="set role authenticated;    set request.jwt.claim.sub = '$BRANCH_AUTH';"
+applicant="set role authenticated; set request.jwt.claim.sub = '$APPLICANT_AUTH';"
+applicant2="set role authenticated; set request.jwt.claim.sub = '$APPLICANT2_AUTH';"
+
+expect_eq "a full admin CAN appoint a branch admin" \
+  "$dtadmin select public.invite_staff('$DENTAL','branch@dtouch.ph','admin',true);" "$BRANCH_AUTH"
+expect_eq "…whose membership is locked to the branch" \
+  "select branch_locked from public.clinic_memberships where profile_id='$BRANCH_AUTH';" "t"
+expect_err "only admins can carry the branch lock" \
+  "update public.clinic_memberships set branch_locked=true where profile_id='$ASST_AUTH';"
+expect_eq "a branch admin sees their branch's appointments" \
+  "$branch select count(*) from public.appointments;" 7
+expect_eq "…reads its clinical notes like any admin" \
+  "$branch select count(*) from public.visit_notes;" 2
+expect_eq "…and sees no other clinic" "$branch select count(*) from public.clinics;" 1
+expect_dml "a branch admin CAN edit their branch's details" "$branch" \
+  "update public.clinics set contact_phone='0917 000 0000' where id='$DENTAL' returning id" 1
+expect_err "a branch admin cannot make anyone an admin" \
+  "$branch select public.invite_staff('$DENTAL','front@clinic.ph','admin');"
+expect_err "…nor another branch admin" \
+  "$branch select public.invite_staff('$DENTAL','front@clinic.ph','admin',true);"
+expect_err "…nor demote the full admin" \
+  "$branch select public.invite_staff('$DENTAL','admin@dtouch.ph','assistant');"
+expect_err "…nor remove them" \
+  "$branch select public.remove_staff('$DENTAL','$DT_ADMIN_AUTH');"
+expect_dml "a branch admin CAN change a doctor to an assistant" "$branch" \
+  "select public.invite_staff('$DENTAL','santos@clinic.ph','assistant') as id" 1
+expect_err "the last FULL admin cannot lock themselves to the branch" \
+  "$dtadmin select public.invite_staff('$DENTAL','admin@dtouch.ph','admin',true);"
+expect_err "another tenant cannot make the branch admin their admin too" \
+  "$bright select public.invite_staff('$BRIGHT','branch@dtouch.ph','admin');"
+expect_err "…nor can the service role, since the lock is on the table" \
+  "insert into public.clinic_memberships (profile_id,clinic_id,role)
+   values ('$BRANCH_AUTH','$OPTO','admin');"
+expect_ok "…though they may still be a doctor elsewhere" \
+  "begin;
+   insert into public.clinic_memberships (profile_id,clinic_id,role) values ('$BRANCH_AUTH','$OPTO','doctor');
+   rollback;"
+expect_err "an admin elsewhere cannot be branch-locked here" \
+  "begin;
+   insert into public.clinic_memberships (profile_id,clinic_id,role) values ('$BRIGHT_ADMIN_AUTH','$DENTAL','admin');
+   update public.clinic_memberships set branch_locked=true
+    where profile_id='$BRIGHT_ADMIN_AUTH' and clinic_id='$DENTAL';
+   rollback;"
+
+print "\n── Staff codes · issue ────────────────────────────────────────"
+code_re='^[A-Z2-9]{8}$'
+expect_err "an assistant cannot issue a staff code" \
+  "$asst select public.create_staff_invite('$DENTAL','assistant');"
+expect_err "a doctor cannot issue a staff code" \
+  "$doc select public.create_staff_invite('$DENTAL','doctor');"
+expect_err "BrightSmile's admin cannot issue a D-Touch code" \
+  "$bright select public.create_staff_invite('$DENTAL','doctor');"
+expect_err "staff codes cannot grant admin" \
+  "$dtadmin select public.create_staff_invite('$DENTAL','admin');"
+expect_err "…nor patient" \
+  "$dtadmin select public.create_staff_invite('$DENTAL','patient');"
+expect_err "validity is capped at 30 days" \
+  "$dtadmin select public.create_staff_invite('$DENTAL','doctor',null,31);"
+DOC_CODE=$(trim "$(psql $CONN -c "$branch select code from public.create_staff_invite('$DENTAL','doctor','Dr Reyes');")")
+ASST_CODE=$(trim "$(psql $CONN -c "$dtadmin select code from public.create_staff_invite('$DENTAL','assistant');")")
+expect_eq "a branch admin CAN issue a doctor code" \
+  "select '$DOC_CODE' ~ '$code_re';" "t"
+expect_eq "a full admin CAN issue an assistant code" \
+  "select '$ASST_CODE' ~ '$code_re' and '$ASST_CODE' <> '$DOC_CODE';" "t"
+expect_eq "D-Touch's admins see both open codes" \
+  "$dtadmin select count(*) from public.staff_invites where status='open';" 2
+expect_eq "…the branch admin too" \
+  "$branch select count(*) from public.staff_invites;" 2
+expect_eq "the front desk sees none" "$asst select count(*) from public.staff_invites;" 0
+expect_eq "another tenant's admin sees none" "$bright select count(*) from public.staff_invites;" 0
+expect_err "nobody writes invites directly" \
+  "$dtadmin insert into public.staff_invites (clinic_id,role) values ('$DENTAL','doctor');"
+DOC_INV=$(trim "$(psql $CONN -c "select id from public.staff_invites where code='$DOC_CODE';")")
+ASST_INV=$(trim "$(psql $CONN -c "select id from public.staff_invites where code='$ASST_CODE';")")
+
+print "\n── Staff codes · redeem ───────────────────────────────────────"
+expect_eq "an applicant starts with no requests" \
+  "$applicant select count(*) from public.my_staff_requests();" 0
+expect_err "a wrong code is rejected" \
+  "$applicant select public.redeem_staff_invite('NOTACODE','doctor');"
+expect_err "the patient join code is not a staff code" \
+  "$applicant select public.redeem_staff_invite('DTOUCH26','doctor');"
+expect_err "a doctor code cannot be used in the assistant app" \
+  "$applicant select public.redeem_staff_invite('$DOC_CODE','assistant');"
+expect_err "existing staff cannot redeem a code at their own clinic" \
+  "$asst select public.redeem_staff_invite('$ASST_CODE','assistant');"
+expect_eq "an applicant CAN redeem a doctor code" \
+  "$applicant select public.redeem_staff_invite(lower('$DOC_CODE'),'doctor');" "$DOC_INV"
+expect_eq "…which files a pending request under their name" \
+  "select status||' '||redeemer_name||' '||redeemer_email from public.staff_invites where id='$DOC_INV';" \
+  "pending Ana Reyes reyes@mail.com"
+expect_eq "…that they can see, with the clinic's name" \
+  "$applicant select clinic_name||' '||status from public.my_staff_requests();" \
+  "D-Touch Dental Clinic pending"
+expect_eq "…and grants no membership" \
+  "$applicant select count(*) from public.clinic_memberships;" 0
+expect_eq "…no clinic" "$applicant select count(*) from public.clinics;" 0
+expect_eq "…and no appointments" "$applicant select count(*) from public.appointments;" 0
+expect_err "a code works once" \
+  "$applicant2 select public.redeem_staff_invite('$DOC_CODE','doctor');"
+expect_eq "another applicant's requests stay private" \
+  "$applicant2 select count(*) from public.my_staff_requests();" 0
+expect_err "anon cannot redeem a code" \
+  "$anon select public.redeem_staff_invite('$ASST_CODE','assistant');"
+expect_ok "expire a fresh code" \
+  "insert into public.staff_invites (clinic_id,role,code,expires_at)
+   values ('$DENTAL','assistant','EXPIRED2',now()-interval '1 minute');"
+expect_err "an expired code is rejected" \
+  "$applicant2 select public.redeem_staff_invite('EXPIRED2','assistant');"
+
+print "\n── Staff codes · approve / reject / revoke ────────────────────"
+BRIGHT_DOC=$(trim "$(psql $CONN -c "select id from public.doctors where clinic_id='$BRIGHT' order by id limit 1;")")
+UNLINKED_DOC=$(trim "$(psql $CONN -c "select id from public.doctors where clinic_id='$DENTAL' and profile_id is null order by id limit 1;")")
+expect_err "an assistant cannot approve" \
+  "$asst select public.decide_staff_request('$DOC_INV',true,null,'Orthodontics');"
+expect_err "the applicant cannot approve themselves" \
+  "$applicant select public.decide_staff_request('$DOC_INV',true,null,'Orthodontics');"
+expect_err "BrightSmile's admin cannot approve a D-Touch request" \
+  "$bright select public.decide_staff_request('$DOC_INV',true,null,'Orthodontics');"
+expect_err "approving a doctor needs a specialty or a roster entry" \
+  "$branch select public.decide_staff_request('$DOC_INV',true);"
+expect_err "…and the roster entry must be this clinic's" \
+  "$branch select public.decide_staff_request('$DOC_INV',true,'$BRIGHT_DOC');"
+expect_err "…and not already linked to someone" \
+  "$branch select public.decide_staff_request('$DOC_INV',true,'$DR_SANTOS');"
+expect_dml "a branch admin CAN approve by linking an existing roster entry" \
+  "$branch do \$\$ begin perform public.decide_staff_request('$DOC_INV',true,'$UNLINKED_DOC'); end \$\$;" \
+  "select id from public.doctors where id='$UNLINKED_DOC' and profile_id='$APPLICANT_AUTH'" 1
+expect_ok "a branch admin CAN approve by creating a roster entry" \
+  "$branch select public.decide_staff_request('$DOC_INV',true,null,'Orthodontics');"
+expect_eq "…which makes them a doctor at D-Touch" \
+  "$applicant select role from public.clinic_memberships;" "doctor"
+expect_eq "…on the roster under their own name" \
+  "select full_name||' / '||specialty from public.doctors where profile_id='$APPLICANT_AUTH';" \
+  "Ana Reyes / Orthodontics"
+expect_eq "…with the request recording who approved and which row" \
+  "select status||' '||(decided_by='$BRANCH_AUTH')||' '||(doctor_id is not null)
+   from public.staff_invites where id='$DOC_INV';" "approved true true"
+expect_eq "…so they now see D-Touch" "$applicant select count(*) from public.clinics;" 1
+expect_eq "…and its appointments" "$applicant select count(*) from public.appointments;" 7
+expect_err "a request cannot be decided twice" \
+  "$dtadmin select public.decide_staff_request('$DOC_INV',false);"
+expect_ok "a second applicant redeems the assistant code" \
+  "$applicant2 select public.redeem_staff_invite('$ASST_CODE','assistant');"
+expect_ok "an admin CAN reject the request" \
+  "$dtadmin select public.decide_staff_request('$ASST_INV',false);"
+expect_eq "…which grants nothing" \
+  "$applicant2 select count(*) from public.clinic_memberships;" 0
+expect_eq "…and the applicant sees it was rejected" \
+  "$applicant2 select status from public.my_staff_requests();" "rejected"
+REV_CODE=$(trim "$(psql $CONN -c "$dtadmin select code from public.create_staff_invite('$DENTAL','assistant');")")
+REV_INV=$(trim "$(psql $CONN -c "select id from public.staff_invites where code='$REV_CODE';")")
+expect_err "an assistant cannot revoke a code" \
+  "$asst select public.revoke_staff_invite('$REV_INV');"
+expect_ok "an admin CAN revoke an open code" \
+  "$dtadmin select public.revoke_staff_invite('$REV_INV');"
+expect_err "…after which it cannot be redeemed" \
+  "$applicant2 select public.redeem_staff_invite('$REV_CODE','assistant');"
+expect_err "a decided request cannot be revoked" \
+  "$dtadmin select public.revoke_staff_invite('$DOC_INV');"
+expect_dml "a branch admin CAN remove the doctor they approved" \
+  "$branch do \$\$ begin perform public.remove_staff('$DENTAL','$APPLICANT_AUTH'); end \$\$;" \
+  "select profile_id from public.clinic_memberships where profile_id='$APPLICANT_AUTH'" 0
+
 print "\n── RLS · anonymous ────────────────────────────────────────────"
 expect_eq "anon sees no appointments" "$anon select count(*) from public.appointments;" 0
 expect_eq "anon sees no clinics"      "$anon select count(*) from public.clinics;" 0

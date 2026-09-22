@@ -147,9 +147,14 @@ deny-by-default and `anon` gets nothing.
 | Doctor roster | read | read + own availability | read | write |
 | Services | read | read | read | write |
 | Clinic details, logo, colour, join code | — | — | — | write |
-| Staff | — | — | — | invite, change role, remove |
+| Staff | — | — | — | add, approve staff codes, change role, remove |
 
 "Clinic" always means *a clinic where the user holds that role*.
+
+A **branch admin** is an `admin` membership with `branch_locked = true`. It
+passes every admin check at that clinic — the column above applies in full —
+except managing admins: `invite_staff` and `remove_staff` refuse to let it
+create, change or remove an admin of either kind.
 
 Deliberate hard edges:
 
@@ -166,8 +171,16 @@ Deliberate hard edges:
 - **Admins run their clinic, not the platform.** Column privileges let an admin
   edit their clinic's name, logo, colour, contact details, timezone and join
   code, but not its vertical, slug or `is_active`.
-- **Every clinic keeps at least one admin.** `invite_staff` and `remove_staff`
-  refuse to demote or remove the last one.
+- **Every clinic keeps at least one full admin.** `invite_staff` and
+  `remove_staff` refuse to demote, branch-lock or remove the last one.
+- **A branch admin is an admin at one branch only.** A trigger on
+  `clinic_memberships` rejects any admin membership elsewhere for an account
+  holding a branch-locked one, whoever writes it — service role included.
+- **A staff code grants nothing by itself.** Codes are single-use, per person,
+  for `doctor` or `assistant`, and expire. `redeem_staff_invite` only files a
+  request; the membership (and a doctor's roster link) is created when an admin
+  approves it with `decide_staff_request`. `staff_invites` has no write policy
+  at all.
 
 ## Setup
 
@@ -207,6 +220,30 @@ Seeded UUIDs are stable and traceable: `1…` clinics, `2…` doctors, `3…` ch
 
 Follow [docs/onboarding.md](docs/onboarding.md).
 
+### 5. Password reset emails
+
+The apps reset passwords with a one-time code typed into the app, not a link,
+so no redirect URLs are involved. Two dashboard settings are needed before it
+works for real users:
+
+1. **Custom SMTP** — *Authentication → Emails → SMTP Settings*. Supabase's
+   built-in mailer only delivers to members of the project's team, a few
+   emails an hour. Any provider works (Resend, Brevo and Postmark have free
+   tiers); verify a sending domain with them first.
+2. **The Reset Password template** — *Authentication → Emails → Templates →
+   Reset Password*. The default body only has a link, and the apps ask for the
+   code. Replace it with something that shows `{{ .Token }}`:
+
+   ```html
+   <h2>Reset your password</h2>
+   <p>Enter this code in the app:</p>
+   <p style="font-size:24px;letter-spacing:4px"><strong>{{ .Token }}</strong></p>
+   <p>It expires in an hour. If you did not ask for this, you can ignore it.</p>
+   ```
+
+Then check *Authentication → Rate Limits*: the email limit caps password resets
+per hour across the whole project.
+
 ### Upgrading a project that predates the tenancy migrations
 
 The `20260914…` migrations carry existing data over: each patient becomes a
@@ -230,10 +267,11 @@ deployed. Ship both together.
 ```
 
 Spins up a throwaway Postgres cluster, applies every migration, seeds twice (to
-prove the seed is idempotent), and runs 164 checks: seed integrity, the
+prove the seed is idempotent), and runs 261 checks: seed integrity, the
 declarative constraints, the auth bridge, RLS from the perspective of a patient,
 doctor, assistant, admin and anonymous caller, isolation between two dental
-tenants, and the onboarding functions.
+tenants, the onboarding functions, branch admins, and the staff-code flow from
+issuing a code to approval.
 
 Needs a local Postgres 15+ (Postgres.app, or `brew install postgresql@17`).
 **No Docker and no Supabase CLI required** — `tests/supabase_shim.sql` stubs the
