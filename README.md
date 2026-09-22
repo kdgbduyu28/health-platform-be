@@ -47,13 +47,24 @@ supabase/
     20260914120200_staff_across_clinics.sql   roles move onto memberships
     20260914120300_tenant_scoped_reads.sql    clinics/doctors/services scoped to members
     20260914120400_onboarding_rpcs.sql        join_clinic, invite_staff, admin self-service
+    20260915120000_private_clinical_notes.sql chart/visit notes, clinicians only
+    20260916120000_staff_approval_and_branch_admins.sql
+    20260922120000_public_clinic_pages.sql    clinic_by_slug for the public page
+    20260923120000_visit_statuses.sql         arrived, in_consultation, no_show
+    20260923120100_visit_flow_and_availability.sql
+    20260924120000_rescheduling.sql           reschedule_appointment
+    20260924120100_billing.sql                invoices, lines, payments
+    20260924120200_notifications.sql          inbox, push subscriptions, reminders
+  functions/
+    send-push/index.ts                        Web Push delivery (Edge Function)
+    .env.example                              the secrets it needs
   seed.sql                                    four demo tenants, re-runnable
   dev/
     create_demo_users.sql                     demo accounts wired to the seed
     provision_clinic.sql                      onboard a real clinic
   tests/
     run.sh                                    throwaway cluster → migrate → seed → test
-    rls_test.sh                               164 behavioural checks
+    rls_test.sh                               395 behavioural checks
     supabase_shim.sql                         test-only stubs for Supabase's auth schema
 docs/
   onboarding.md                               runbook for adding a clinic client
@@ -79,6 +90,11 @@ fixes, and each leaves the database in a working state on its own.
 | `chart_notes` | The standing medical note on a chart (allergies, conditions). Clinicians only. |
 | `visit_notes` | The consultation note on an appointment. Clinicians only. |
 | `doctor_time_off` | Days nobody can book: a doctor's leave, or (no `doctor_id`) the whole clinic closed. |
+| `invoices` | A bill, usually for one visit: draft → issued (numbered, locked) → paid, or void. Totals are computed, never written by a client. |
+| `invoice_items` | A bill's lines. Editable only while the bill is a draft. |
+| `payments` | Money received on an issued bill. Never edited or deleted; an admin voids a mistake, with a reason. |
+| `notifications` | Each account's inbox, one row per update, for one app. Written only by triggers. |
+| `push_subscriptions` | Browsers that asked for Web Push: one row per browser, owned by whoever signed in last on it. |
 
 Integrity is declarative wherever possible:
 
@@ -113,6 +129,78 @@ booking screen may offer: the doctor's working weekday and listed times, no
 time off, not past, and nothing overlapping for the service's whole length.
 A **patient's** booking must be one of them (trigger). Staff may book off the
 grid — a walk-in squeezed in at 11:10 — but never on top of another visit.
+
+### Rescheduling
+
+`public.reschedule_appointment(appointment, new_start, doctor?)` moves a visit
+that has not started (pending or confirmed) to a time still to come, keeping
+its history, notes and bill on one row. `rescheduled_from`, `rescheduled_at`,
+`rescheduled_by` and `reschedule_count` record the move.
+
+- A **patient** moves only their own visit, only to a time `available_slots`
+  offers, and it goes back to `pending`: the clinic agreed to the old time,
+  not the new one.
+- **Staff** keep the status, may switch the doctor, and may go off the grid —
+  never onto another visit.
+
+`available_slots` takes an optional fourth argument, the visit being moved, so
+a 60-minute visit can still shift by 30 minutes. A patient's own `UPDATE` may
+change the status (to cancel) and nothing else.
+
+### Billing
+
+```
+draft ──issue──→ issued ⇄ paid        (paid once the payments cover it)
+  │                 └──void──→ void   (only with no payments standing)
+  └─ deleted
+```
+
+- `create_invoice_for_appointment(visit)` starts a draft with the visit's
+  service at the catalogue price (zero if none is set) — or returns the
+  visit's existing bill. One live bill per visit.
+- While a draft: add, edit and remove lines; set a discount (the apps offer
+  senior citizen / PWD 20%). `issue_invoice` numbers it per clinic
+  (`INV-000001`) and locks it.
+- `payments` go on an issued bill, for no more than it still owes, stamped
+  with who received them and *now* — they cannot be backdated. A bill with
+  its balance covered becomes `paid`.
+- `void_payment` is **admin only**: the front desk handles cash, so it does
+  not also get to make a payment disappear. `void_invoice` needs a reason and
+  no standing payments; the number stays used.
+- `billing_summary(clinic, from, to)` gives money collected (by method),
+  billed, and outstanding.
+
+The front desk and admins bill (`private.can_bill`); doctors read. A patient
+reads their own bills once issued, never drafts. These are **statements of
+account, not BIR official receipts** — nothing here is an accredited receipting
+system, and the apps say so on every bill.
+
+### Notifications
+
+Supabase has no push service of its own; this uses its standard pieces.
+
+```
+appointments / invoices ──trigger──→ notifications ──pg_net──→ send-push ──Web Push──→ browsers
+                                          │                    (Edge Function)
+                                          └── Realtime ──→ the in-app inbox
+pg_cron ──every 15 min──→ send_visit_reminders()
+```
+
+| Who | Hears about |
+|---|---|
+| patient | visit confirmed, moved or cancelled by the clinic; a note from the doctor; a bill issued; a reminder within 24 h of a confirmed visit |
+| front desk (assistants, admins) | a patient's booking request, move or cancellation |
+| doctor | their patient is in the waiting room |
+
+Nobody is told about their own action; walk-ins without an account and the
+service role notify no one. Each notification belongs to one **app**, and is
+pushed only to browsers subscribed in that app, with a link into it.
+
+The apps are web builds, so this is standard Web Push with a VAPID key — no
+Firebase project, no app-store builds. On iPhone, Web Push reaches a site only
+once it is added to the home screen (iOS 16.4+); the inbox reaches everyone.
+Signing out removes that browser's subscription first, so a shared device does
+not keep receiving the last person's notifications.
 
 ## Tenancy
 
@@ -173,6 +261,11 @@ active clinic. Never the join code, never a doctor's account.
 | Services | read | read | read | write |
 | Clinic details, logo, colour, join code | — | — | — | write |
 | Staff | — | — | — | add, approve staff codes, change role, remove |
+| Reschedule | own, to an offered time; back to `pending` | clinic | clinic | clinic |
+| Bills and lines | own, once issued (read) | read | write | write |
+| Take a payment | — | — | yes | yes |
+| Void a payment | — | — | — | yes |
+| Notifications | own inbox | own inbox | own inbox | own inbox |
 
 "Clinic" always means *a clinic where the user holds that role*.
 
@@ -184,7 +277,8 @@ create, change or remove an admin of either kind.
 Deliberate hard edges:
 
 - **Patients cannot confirm their own bookings.** Inserts are forced to
-  `status = 'pending'`; the only change a patient may make is `'cancelled'`.
+  `status = 'pending'`; the only change a patient may make is `'cancelled'`,
+  or a move through `reschedule_appointment`, which sends it back to pending.
   They cannot read or write clinical notes at all, only the `patient_note`
   their doctor leaves on an appointment.
 - **A signup grants nothing.** `handle_new_user` creates a profile and ignores
@@ -269,6 +363,42 @@ works for real users:
 Then check *Authentication → Rate Limits*: the email limit caps password resets
 per hour across the whole project.
 
+### 6. Push notifications
+
+The inbox works as soon as the migrations are in. Push needs four more steps,
+once per project:
+
+1. **Secrets for the function.** `supabase/functions/.env` (gitignored; copy
+   `.env.example`) holds the VAPID key pair, a contact address, and a shared
+   secret. Generate a key pair with `npx web-push generate-vapid-keys` and put
+   its **public** half in the apps too (`SupabaseConfig.vapidPublicKey`, or
+   `--dart-define=VAPID_PUBLIC_KEY=…`). Then:
+
+   ```sh
+   supabase secrets set --env-file supabase/functions/.env
+   ```
+
+2. **Deploy the function** (`config.toml` turns off its JWT check; the shared
+   secret is what authorises the database's calls):
+
+   ```sh
+   supabase functions deploy send-push --use-api
+   ```
+
+3. **Tell the database where it is**, in the SQL Editor, with the same secret:
+
+   ```sql
+   select vault.create_secret('https://<project-ref>.supabase.co/functions/v1/send-push', 'push_function_url');
+   select vault.create_secret('<PUSH_WEBHOOK_SECRET>', 'push_webhook_secret');
+   ```
+
+4. Check that the migration scheduled the reminders:
+   `select jobname, schedule from cron.job;` lists `visit-reminders` and
+   `prune-notifications`.
+
+To see a delivery fail, look at `net._http_response` (the database's side) and
+the function's logs in the dashboard.
+
 ### Upgrading a project that predates the tenancy migrations
 
 The `20260914…` migrations carry existing data over: each patient becomes a
@@ -292,11 +422,13 @@ deployed. Ship both together.
 ```
 
 Spins up a throwaway Postgres cluster, applies every migration, seeds twice (to
-prove the seed is idempotent), and runs 261 checks: seed integrity, the
+prove the seed is idempotent), and runs 395 checks: seed integrity, the
 declarative constraints, the auth bridge, RLS from the perspective of a patient,
 doctor, assistant, admin and anonymous caller, isolation between two dental
-tenants, the onboarding functions, branch admins, and the staff-code flow from
-issuing a code to approval.
+tenants, the onboarding functions, branch admins, the staff-code flow, the
+visit flow and availability, rescheduling, billing, and who is notified of
+what. The test cluster has no pg_net or pg_cron, so it checks what lands in
+the inbox, not delivery.
 
 Needs a local Postgres 15+ (Postgres.app, or `brew install postgresql@17`).
 **No Docker and no Supabase CLI required** — `tests/supabase_shim.sql` stubs the

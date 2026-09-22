@@ -895,6 +895,243 @@ expect_eq "the public page shows a service's price" \
    $anon select s->>'price' from jsonb_array_elements(public.clinic_by_slug('dtouchdental')->'services') s
    where s->>'name'='Root Canal'; rollback;" "1500.00"
 
+print "\n── Rescheduling ───────────────────────────────────────────────"
+expect_eq "a patient moves their visit to an offered time; the clinic confirms it again" \
+  "begin; $NEWV $juan do \$\$ begin perform public.reschedule_appointment('$V1', $(at 10:30)); end \$\$;
+   select status || '/' || reschedule_count || '/' || (rescheduled_from = $(at 09:00))
+   from public.appointments where id='$V1'; rollback;" "pending/1/true"
+expect_ok "…even by half an hour, overlapping the time it is leaving" \
+  "begin; $NEWV $juan select public.reschedule_appointment('$V1', $(at 09:30)); rollback;"
+expect_eq "availability can leave the visit being moved out of the reckoning" \
+  "begin; $NEWV $juan select (select count(*) from public.available_slots('$DR_SANTOS','$MON',$ROOT_CANAL)) || '/'
+   || (select count(*) from public.available_slots('$DR_SANTOS','$MON',$ROOT_CANAL,'$V1')); rollback;" "3/8"
+expect_err_msg "a patient cannot move off the grid" \
+  "begin; $NEWV $juan select public.reschedule_appointment('$V1', $(at 09:10));" "not available"
+expect_err_msg "…nor onto a closure" \
+  "begin; $NEWV insert into public.doctor_time_off (clinic_id,starts_on,ends_on) values ('$DENTAL','$MON'::date + 2,'$MON'::date + 2);
+   $juan select public.reschedule_appointment('$V1', (('$MON'::date + 2 + time '09:00') at time zone 'Asia/Manila'));" "not available"
+expect_err_msg "…nor move someone else's visit" \
+  "begin; insert into public.appointments (id,clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$V1','$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',$(at 09:00),'confirmed');
+   $juan select public.reschedule_appointment('$V1', $(at 10:30));" "not found"
+expect_err_msg "…nor one that has started" \
+  "begin; $NEWV update public.appointments set status='arrived' where id='$V1';
+   $juan select public.reschedule_appointment('$V1', $(at 10:30));" "has not started"
+expect_err_msg "nobody moves a visit into the past" \
+  "begin; $NEWV $asst select public.reschedule_appointment('$V1', now() - interval '1 hour');" "still to come"
+expect_eq "the front desk moves a visit to another doctor, and it stays confirmed" \
+  "begin; $NEWV $asst do \$\$ begin perform public.reschedule_appointment('$V1', $(at 14:10), '$DR_REYES'); end \$\$;
+   select status || '/' || (doctor_id = '$DR_REYES') from public.appointments where id='$V1'; rollback;" "confirmed/true"
+expect_err_msg "…but not on top of another visit" \
+  "begin; $NEWV insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',$(at 11:00),'confirmed');
+   $asst select public.reschedule_appointment('$V1', $(at 10:30));" "already has a visit"
+expect_err_msg "another clinic cannot move it" \
+  "begin; $NEWV $bright select public.reschedule_appointment('$V1', $(at 10:30));" "not found"
+expect_err_msg "a patient's own update changes the status only" \
+  "begin; $NEWV $juan update public.appointments set status='cancelled', scheduled_at=$(at 10:30) where id='$V1';" "cancel or reschedule"
+expect_err "anon cannot move a visit" \
+  "$anon select public.reschedule_appointment('$A2', now() + interval '70 days');"
+
+print "\n── Billing ────────────────────────────────────────────────────"
+# Root Canal at ₱1,500; Juan's visit V1 has arrived.
+PRICED="update public.services set price=1500 where clinic_id='$DENTAL' and name='Root Canal';"
+HERE_V="$PRICED $NEWV update public.appointments set status='arrived' where id='$V1';"
+BILL="(select id from public.invoices where appointment_id='$V1' and status <> 'void')"
+# DO blocks, so a function's return value does not land in the checked output.
+MAKE_BILL="do \$\$ begin perform public.create_invoice_for_appointment('$V1'); end \$\$;"
+ISSUED="$HERE_V $asst $MAKE_BILL do \$\$ begin perform public.issue_invoice($BILL); end \$\$;"
+expect_eq "the front desk bills a visit: one line, at the catalogue price" \
+  "begin; $HERE_V $asst $MAKE_BILL
+   select v.subtotal || '/' || v.total || '/' || v.status || '/' || count(i.*)
+   from public.invoices v join public.invoice_items i on i.invoice_id = v.id
+   where v.appointment_id='$V1' group by v.id; rollback;" "1500.00/1500.00/draft/1"
+expect_eq "asking twice gives the same bill" \
+  "begin; $HERE_V $asst select public.create_invoice_for_appointment('$V1') = public.create_invoice_for_appointment('$V1'); rollback;" "t"
+expect_err_msg "a visit still pending is not billed yet" \
+  "begin; $PRICED $NEWV update public.appointments set status='pending' where id='$V1';
+   $asst $MAKE_BILL" "once the patient is here"
+expect_err "a doctor reads bills but does not write them" \
+  "begin; $HERE_V $doc $MAKE_BILL"
+expect_eq "a client cannot write the totals or the status" \
+  "begin; $asst insert into public.invoices (clinic_id,patient_id,status,subtotal,amount_paid,number)
+   values ('$DENTAL','$PT_JUAN','paid',5,5,'INV-999999')
+   returning status || '/' || subtotal || '/' || coalesce(number,'-'); rollback;" "draft/0.00/-"
+expect_err_msg "…nor mark a bill paid" \
+  "begin; $HERE_V $asst $MAKE_BILL update public.invoices set status='paid' where appointment_id='$V1';" "with its buttons"
+expect_eq "a senior citizen's 20% comes off the total" \
+  "begin; $HERE_V $asst $MAKE_BILL
+   update public.invoices set discount_amount=300, discount_reason='Senior citizen' where appointment_id='$V1';
+   select total from public.invoices where appointment_id='$V1'; rollback;" "1200.00"
+expect_err_msg "a discount cannot exceed the bill" \
+  "begin; $HERE_V $asst $MAKE_BILL
+   update public.invoices set discount_amount=2000 where appointment_id='$V1';" "more than the bill"
+expect_eq "adding a line updates the total" \
+  "begin; $HERE_V $asst $MAKE_BILL
+   insert into public.invoice_items (invoice_id,clinic_id,description,quantity,unit_price)
+   values ($BILL,'$DENTAL','X-ray',2,250);
+   select subtotal from public.invoices where appointment_id='$V1'; rollback;" "2000.00"
+expect_eq "issuing numbers the bill" \
+  "begin; $ISSUED select number || '/' || status from public.invoices where appointment_id='$V1'; rollback;" "INV-000001/issued"
+expect_err_msg "an issued bill's lines are locked" \
+  "begin; $ISSUED insert into public.invoice_items (invoice_id,clinic_id,description,unit_price)
+   values ($BILL,'$DENTAL','Extra',100);" "can no longer be changed"
+expect_err_msg "…and so is its discount" \
+  "begin; $ISSUED update public.invoices set discount_amount=100 where id=$BILL;" "can no longer be changed"
+expect_err_msg "an empty bill cannot be issued" \
+  "begin; $HERE_V $asst $MAKE_BILL delete from public.invoice_items where invoice_id=$BILL;
+   select public.issue_invoice($BILL);" "at least one line"
+expect_err_msg "no payment on a draft" \
+  "begin; $HERE_V $asst $MAKE_BILL
+   insert into public.payments (invoice_id,clinic_id,amount) values ($BILL,'$DENTAL',100);" "Issue the bill"
+expect_eq "a part payment leaves a balance; the rest pays the bill" \
+  "begin; $ISSUED
+   insert into public.payments (invoice_id,clinic_id,amount,method) values ($BILL,'$DENTAL',500,'cash');
+   select status || '/' || balance from public.invoices where id=$BILL; rollback;" "issued/1000.00"
+expect_eq "…and the rest pays it" \
+  "begin; $ISSUED
+   insert into public.payments (invoice_id,clinic_id,amount,method) values ($BILL,'$DENTAL',500,'cash');
+   insert into public.payments (invoice_id,clinic_id,amount,method,reference) values ($BILL,'$DENTAL',1000,'gcash','GC-123');
+   select status || '/' || balance from public.invoices where id=$BILL; rollback;" "paid/0.00"
+expect_err_msg "no paying more than is owed" \
+  "begin; $ISSUED insert into public.payments (invoice_id,clinic_id,amount) values ($BILL,'$DENTAL',1500.01);" "more than the"
+expect_eq "a payment cannot be backdated" \
+  "begin; $ISSUED insert into public.payments (invoice_id,clinic_id,amount,received_at)
+   values ($BILL,'$DENTAL',100,now() - interval '30 days') returning received_at > now() - interval '1 minute'; rollback;" "t"
+# No UPDATE policy, so an edit matches nothing rather than raising.
+expect_dml "a payment cannot be edited" \
+  "$ISSUED insert into public.payments (invoice_id,clinic_id,amount) values ($BILL,'$DENTAL',100);" \
+  "update public.payments set amount=1 where invoice_id=$BILL returning id" 0
+PAID1500="$ISSUED insert into public.payments (invoice_id,clinic_id,amount) values ($BILL,'$DENTAL',1500);"
+expect_err_msg "the front desk cannot void a payment" \
+  "begin; $PAID1500 select public.void_payment((select id from public.payments where invoice_id=$BILL), 'typo');" "Only an admin"
+expect_eq "an admin can, with a reason, and the bill is owed again" \
+  "begin; $PAID1500 $dtadmin do \$\$ begin perform public.void_payment((select id from public.payments where invoice_id=$BILL), 'Wrong amount'); end \$\$;
+   select status || '/' || balance from public.invoices where id=$BILL; rollback;" "issued/1500.00"
+expect_err_msg "a paid bill cannot be voided while its payments stand" \
+  "begin; $PAID1500 select public.void_invoice($BILL, 'Billed the wrong patient');" "void them first"
+expect_err_msg "voiding needs a reason" \
+  "begin; $ISSUED select public.void_invoice($BILL, '  ');" "Say why"
+expect_eq "a voided bill keeps its number and frees the visit for a new one" \
+  "begin; $ISSUED do \$\$ begin perform public.void_invoice($BILL, 'Wrong service'); end \$\$;
+   do \$\$ begin perform public.create_invoice_for_appointment('$V1'); end \$\$;
+   select string_agg(status::text || ':' || coalesce(number,'-'), ',' order by created_at, status)
+   from public.invoices where appointment_id='$V1'; rollback;" "draft:-,void:INV-000001"
+expect_dml "a draft can be deleted" "$HERE_V $asst $MAKE_BILL" \
+  "delete from public.invoices where appointment_id='$V1' returning id" 1
+expect_dml "…an issued bill cannot" "$ISSUED" \
+  "delete from public.invoices where appointment_id='$V1' returning id" 0
+expect_eq "a patient does not see a draft" \
+  "begin; $HERE_V $asst $MAKE_BILL $juan select count(*) from public.invoices; rollback;" 0
+expect_eq "…sees an issued bill, its lines and payments" \
+  "begin; $PAID1500 $juan select (select count(*) from public.invoices) || '/'
+   || (select count(*) from public.invoice_items) || '/' || (select count(*) from public.payments); rollback;" "1/1/1"
+expect_err "…and cannot pay it from the app" \
+  "begin; $ISSUED $juan insert into public.payments (invoice_id,clinic_id,amount) values ($BILL,'$DENTAL',1);"
+expect_eq "a doctor at the clinic can read it" \
+  "begin; $ISSUED $doc select count(*) from public.invoices; rollback;" 1
+expect_eq "another clinic sees nothing" \
+  "begin; $PAID1500 $bright select (select count(*) from public.invoices) + (select count(*) from public.payments); rollback;" 0
+expect_eq "the day's takings, by method, and what is still owed" \
+  "begin; $ISSUED insert into public.payments (invoice_id,clinic_id,amount,method) values ($BILL,'$DENTAL',500,'gcash');
+   $dtadmin select s->>'collected' || '/' || (s->'by_method'->>'gcash') || '/' || (s->>'outstanding')
+   from public.billing_summary('$DENTAL', current_date - 1, current_date + 1) s; rollback;" "500.00/500.00/1000.00"
+expect_eq "…which another clinic's admin cannot read" \
+  "begin; $ISSUED $bright select public.billing_summary('$DENTAL', current_date - 1, current_date + 1)->>'billed'; rollback;" "0"
+
+print "\n── Notifications ──────────────────────────────────────────────"
+FRONT_DESK=$(trim "$(psql $CONN -c "select count(*) from public.clinic_memberships where clinic_id='$DENTAL' and role in ('assistant','admin');")")
+N="public.notifications"
+JUAN_BOOKS="$juan insert into public.appointments (id,clinic_id,patient_id,doctor_id,service_name,scheduled_at)
+            values ('$V1','$DENTAL','$PT_JUAN','$DR_SANTOS','Check-up',$(at 09:00));"
+expect_eq "a patient's booking request reaches everyone at the front desk" \
+  "begin; $JUAN_BOOKS reset role; select count(*) from $N where kind='booking_requested' and appointment_id='$V1'; rollback;" "$FRONT_DESK"
+expect_eq "…each in their own app, opening where they would handle it" \
+  "begin; $JUAN_BOOKS reset role; select string_agg(distinct app || ' ' || link, ',') from $N where kind='booking_requested';
+   rollback;" "admin /dtouchdental/appointments/$V1,assistant /dtouchdental/check-in"
+expect_eq "…and not the patient who made it" \
+  "begin; $JUAN_BOOKS reset role; select count(*) from $N where profile_id='$JUAN_AUTH'; rollback;" 0
+expect_eq "confirming tells the patient" \
+  "begin; $JUAN_BOOKS $asst update public.appointments set status='confirmed' where id='$V1';
+   reset role; select app || ' ' || title || ' ' || link from $N where profile_id='$JUAN_AUTH'; rollback;" \
+  "patient Visit confirmed /dtouchdental/appointments/$V1"
+expect_eq "a patient's cancellation tells the front desk" \
+  "begin; $NEWV $juan update public.appointments set status='cancelled' where id='$V1';
+   reset role; select count(*) from $N where kind='visit_cancelled' and profile_id <> '$JUAN_AUTH'; rollback;" "$FRONT_DESK"
+expect_eq "the clinic's cancellation tells the patient" \
+  "begin; $NEWV $asst update public.appointments set status='cancelled' where id='$V1';
+   reset role; select count(*) from $N where kind='visit_cancelled' and profile_id='$JUAN_AUTH'; rollback;" 1
+expect_eq "check-in tells the doctor, in the doctor app" \
+  "begin; $NEWV $asst update public.appointments set status='arrived' where id='$V1';
+   reset role; select app || ' ' || title from $N where profile_id='$DOC_AUTH'; rollback;" "doctor Juan dela Cruz is here"
+expect_eq "the clinic moving a visit tells the patient" \
+  "begin; $NEWV $asst do \$\$ begin perform public.reschedule_appointment('$V1', $(at 10:30)); end \$\$;
+   reset role; select kind from $N where profile_id='$JUAN_AUTH'; rollback;" "visit_moved"
+expect_eq "the patient moving it asks the front desk to confirm" \
+  "begin; $NEWV $juan do \$\$ begin perform public.reschedule_appointment('$V1', $(at 10:30)); end \$\$;
+   reset role; select count(*) from $N where kind='visit_moved' and profile_id <> '$JUAN_AUTH'; rollback;" "$FRONT_DESK"
+expect_eq "a doctor's note to the patient tells them" \
+  "begin; $NEWV $doc update public.appointments set patient_note='Floss nightly.' where id='$V1';
+   reset role; select title || ': ' || body from $N where profile_id='$JUAN_AUTH'; rollback;" "A note from Dr. Maria Santos: Floss nightly."
+expect_eq "a patient without an account is simply not told" \
+  "begin; insert into public.appointments (id,clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$V1','$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',$(at 09:00),'pending');
+   $asst update public.appointments set status='confirmed' where id='$V1';
+   reset role; select count(*) from $N; rollback;" 0
+expect_eq "the service role notifies no one" \
+  "begin; $NEWV update public.appointments set status='arrived' where id='$V1'; select count(*) from $N; rollback;" 0
+expect_eq "issuing a bill tells the patient where to find it" \
+  "begin; $ISSUED reset role; select body || ' ' || (link = '/dtouchdental/bills/' || $BILL)
+   from $N where profile_id='$JUAN_AUTH'; rollback;" "INV-000001 · ₱1,500.00 true"
+expect_eq "a patient reads only their own inbox" \
+  "begin; $JUAN_BOOKS $asst update public.appointments set status='confirmed' where id='$V1';
+   $juan select count(*) from $N; rollback;" 1
+expect_dml "a patient can mark a notification read" \
+  "$JUAN_BOOKS $asst update public.appointments set status='confirmed' where id='$V1'; $juan" \
+  "update $N set read_at=now() returning id" 1
+expect_err_msg "…but not rewrite it" \
+  "begin; $JUAN_BOOKS $asst update public.appointments set status='confirmed' where id='$V1';
+   $juan update $N set title='Free visits for life';" "Only read_at"
+expect_dml "…nor mark someone else's" \
+  "$JUAN_BOOKS $asst" "update $N set read_at=now() where profile_id <> '$ASST_AUTH' returning id" 0
+expect_err "nobody writes notifications directly" \
+  "$juan insert into $N (profile_id,app,kind,title,body) values ('$JUAN_AUTH','patient','x','x','x');"
+SOON="insert into public.appointments (id,clinic_id,patient_id,doctor_id,service_name,scheduled_at,status,created_at)
+      values ('$V2','$DENTAL','$PT_JUAN','$DR_REYES','Check-up',
+              date_trunc('minute', now()) + interval '20 hours 3 minutes','confirmed',now() - interval '1 day');"
+CLEAR_REYES="delete from public.appointments where doctor_id='$DR_REYES' and scheduled_at < now() + interval '2 days';"
+expect_eq "a confirmed visit within the day gets one reminder" \
+  "begin; $CLEAR_REYES $SOON do \$\$ begin perform private.send_visit_reminders(); end \$\$;
+   select private.send_visit_reminders()
+   || '/' || (select count(*) from $N where kind='visit_reminder' and profile_id='$JUAN_AUTH'); rollback;" "0/1"
+expect_eq "…and another once it has moved" \
+  "begin; $CLEAR_REYES $SOON do \$\$ begin perform private.send_visit_reminders(); end \$\$;
+   update public.appointments set scheduled_at = scheduled_at + interval '1 hour' where id='$V2';
+   select private.send_visit_reminders(); rollback;" 1
+expect_eq "a visit booked just now is not reminded about" \
+  "begin; $CLEAR_REYES $SOON update public.appointments set created_at=now() where id='$V2';
+   select private.send_visit_reminders(); rollback;" 0
+
+print "\n── Push subscriptions ─────────────────────────────────────────"
+SUB="do \$\$ begin perform public.save_push_subscription('patient','https://push.example/abc','key','secret'); end \$\$;"
+expect_eq "a browser subscribes for the signed-in account" \
+  "begin; $juan $SUB select count(*) from public.push_subscriptions; rollback;" 1
+expect_eq "the next account on that browser takes it over" \
+  "begin; $juan $SUB $asst do \$\$ begin perform public.save_push_subscription('assistant','https://push.example/abc','key2','secret2'); end \$\$;
+   reset role; select profile_id || ' ' || app from public.push_subscriptions; rollback;" "$ASST_AUTH assistant"
+expect_eq "signing out removes it" \
+  "begin; $juan $SUB do \$\$ begin perform public.delete_push_subscription('https://push.example/abc'); end \$\$;
+   reset role; select count(*) from public.push_subscriptions; rollback;" 0
+expect_eq "…but not someone else's" \
+  "begin; $juan $SUB $asst do \$\$ begin perform public.delete_push_subscription('https://push.example/abc'); end \$\$;
+   reset role; select count(*) from public.push_subscriptions; rollback;" 1
+expect_eq "nobody reads another account's subscriptions" \
+  "begin; $juan $SUB $asst select count(*) from public.push_subscriptions; rollback;" 0
+expect_err_msg "only a real push endpoint is accepted" \
+  "$juan select public.save_push_subscription('patient','http://evil.example/','k','s');" "not a push subscription"
+expect_err "anon cannot subscribe" \
+  "$anon select public.save_push_subscription('patient','https://push.example/x','k','s');"
+
 print "\n── RLS · anonymous ────────────────────────────────────────────"
 expect_eq "anon sees no appointments" "$anon select count(*) from public.appointments;" 0
 expect_eq "anon sees no clinics"      "$anon select count(*) from public.clinics;" 0

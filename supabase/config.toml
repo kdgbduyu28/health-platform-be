@@ -412,3 +412,8 @@ enabled = true
 # declarative_schema_path = "./database"
 # JSON string passed through to pg-delta SQL formatting.
 # format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":80,\"commaStyle\":\"trailing\"}"
+
+# Called by the database over pg_net with a shared secret (x-push-secret), not
+# by a signed-in user, so there is no JWT to verify.
+[functions.send-push]
+verify_jwt = false
