@@ -39,8 +39,14 @@ They will then see **No clinic access yet**. That is expected; step 4 fixes it.
 Open `supabase/dev/provision_clinic.sql` and edit the constants at the top:
 name, slug, vertical, colour, the admin's email, and the services list.
 
-- **slug** is permanent and URL-safe: lowercase letters, digits and dashes
-  (`brightsmile-dental-studio`). The clinic's admin cannot change it later.
+- **slug** is the clinic's address in every app — `https://<patient app>/brightsmile`
+  is its public page, `https://<doctor app>/brightsmile` its doctors' sign-in —
+  so keep it short and give it to the clinic. Lowercase letters, digits and
+  dashes, 3–63 characters, not a route name (`not-found`, `sign-in`, `join`…;
+  the `clinics_slug_not_reserved` constraint has the list). The clinic's admin
+  cannot change it later.
+- Renaming a slug **breaks every link and bookmark** to the old one. There are
+  no redirects from old slugs.
 - **vertical**: use an existing one (`dental`, `optometry`, `pedia`) or a new
   slug. For a new vertical, also set its display name and a
   [Material icon name](https://fonts.google.com/icons) (e.g. `face` for

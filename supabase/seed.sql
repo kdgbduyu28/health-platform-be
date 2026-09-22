@@ -47,7 +47,7 @@ insert into public.clinics
   (id, type, name, slug, join_code, seed_color, logo_url, wordmark_url)
 values
   ('10000000-0000-0000-0000-000000000001', 'dental',    'D-Touch Dental Clinic',
-   'd-touch-dental-clinic',     'DTOUCH26', '#654F3B',
+   'dtouchdental',              'DTOUCH26', '#654F3B',
    'asset:assets/brand/dtouch_mark.png', 'asset:assets/brand/dtouch_wordmark.png'),
   ('10000000-0000-0000-0000-000000000002', 'optometry', 'ClearVision Eye Clinic',
    'clearvision-eye-clinic',    'CLEARV26', '#1E6FA8', null, null),

@@ -131,7 +131,10 @@ Merging duplicates is an operator task.
 ## Roles and access
 
 Four roles, matching the four apps, each held **per clinic**. Every table is
-deny-by-default and `anon` gets nothing.
+deny-by-default and `anon` reads no table. Its one door is
+`public.clinic_by_slug(slug)`: the public page at `/:clinic` in the apps —
+name, branding, contact details, active services and active doctors of an
+active clinic. Never the join code, never a doctor's account.
 
 | | patient | doctor | assistant | admin |
 |---|---|---|---|---|

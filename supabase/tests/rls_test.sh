@@ -733,6 +733,37 @@ expect_err "anon cannot call join_clinic" "$anon select public.join_clinic('DTOU
 expect_err "anon cannot call invite_staff" \
   "$anon select public.invite_staff('$DENTAL','newbie@mail.com','admin');"
 
+print "\n── Public clinic pages ────────────────────────────────────────"
+expect_eq "anon CAN read a clinic's public page by slug" \
+  "$anon select public.clinic_by_slug('dtouchdental')->>'name';" "D-Touch Dental Clinic"
+expect_eq "…matched case- and space-insensitively" \
+  "$anon select public.clinic_by_slug('  DTouchDental ')->>'id';" "$DENTAL"
+expect_eq "…with the vertical embedded the way the apps read it" \
+  "$anon select public.clinic_by_slug('dtouchdental')->'clinic_type'->>'display_name' is not null;" "t"
+expect_eq "…but NEVER the join code" \
+  "$anon select public.clinic_by_slug('dtouchdental') ? 'join_code';" "f"
+expect_eq "…nor any doctor's linked account" \
+  "$anon select count(*) from jsonb_array_elements(public.clinic_by_slug('dtouchdental')->'doctors') d where d ? 'profile_id';" 0
+DT_ACTIVE_SERVICES=$(trim "$(psql $CONN -c "select count(*) from public.services where clinic_id='$DENTAL' and is_active;")")
+expect_eq "…listing every active service" \
+  "$anon select jsonb_array_length(public.clinic_by_slug('dtouchdental')->'services');" "$DT_ACTIVE_SERVICES"
+expect_eq "an unknown slug is null, not an error" \
+  "$anon select public.clinic_by_slug('no-such-clinic') is null;" "t"
+expect_eq "an inactive doctor is left off the page" \
+  "begin; update public.doctors set is_active=false where id='$DR_SANTOS';
+   $anon select count(*) from jsonb_array_elements(public.clinic_by_slug('dtouchdental')->'doctors') d
+   where d->>'id'='$DR_SANTOS'; rollback;" 0
+expect_eq "a suspended clinic's page looks like a mistyped link" \
+  "begin; update public.clinics set is_active=false where id='$DENTAL';
+   $anon select public.clinic_by_slug('dtouchdental') is null; rollback;" "t"
+expect_err "a clinic cannot take a route's name as its slug" \
+  "update public.clinics set slug='not-found' where id='$OPTO';"
+expect_err "…nor a two-letter slug" \
+  "update public.clinics set slug='cv' where id='$OPTO';"
+# A column privilege, so this one raises rather than matching zero rows.
+expect_err "an admin still cannot change their clinic's slug" \
+  "$dtadmin update public.clinics set slug='mine' where id='$DENTAL';"
+
 print "\n── RLS coverage ───────────────────────────────────────────────"
 expect_eq "no public table left without RLS" \
   "select count(*) from pg_tables t
