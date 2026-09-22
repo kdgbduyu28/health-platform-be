@@ -71,18 +71,21 @@ fixes, and each leaves the database in a working state on its own.
 | `clinics` | The tenants. Name, slug, vertical, brand colour, logo, join code, `is_active`. |
 | `profiles` | 1:1 with `auth.users`. An account and nothing more — no role. |
 | `clinic_memberships` | Staff: which clinics an account works at, and **its role at each one**. |
-| `services` | Per-clinic service catalogue with durations. |
+| `services` | Per-clinic service catalogue: duration (what a visit blocks) and an optional price. |
 | `doctors` | Per-clinic roster. The same account may be on several clinics' rosters. |
 | `persons` | Who someone is: name, phone, email, DOB, optional account link. One per human. |
 | `patients` | A **chart**: one per (person, clinic). Belongs to that clinic forever. |
 | `appointments` | The core table. `service_name` snapshots the service at booking time so renaming a service never rewrites history. `patient_note` is what the doctor wants the patient to read. |
 | `chart_notes` | The standing medical note on a chart (allergies, conditions). Clinicians only. |
 | `visit_notes` | The consultation note on an appointment. Clinicians only. |
+| `doctor_time_off` | Days nobody can book: a doctor's leave, or (no `doctor_id`) the whole clinic closed. |
 
 Integrity is declarative wherever possible:
 
-- **No double-booking** — a partial unique index on `(doctor_id, scheduled_at)`
-  excluding cancelled rows, so a freed slot can be rebooked.
+- **No overlapping visits** — each appointment ends at `scheduled_at` plus its
+  service's duration (`ends_at`, set by trigger), and an exclusion constraint
+  refuses two visits of one doctor that overlap. Cancelled visits and no-shows
+  free their time.
 - **No cross-clinic bookings** — composite foreign keys pin an appointment's
   doctor, service *and chart* to its clinic. No trigger needed.
 - **One chart per person per clinic**, and a chart can never move to another
@@ -91,6 +94,25 @@ Integrity is declarative wherever possible:
   slugs, join codes and brand colours are format-checked.
 - `appointments` is published to `supabase_realtime`. RLS still applies to the
   realtime payloads.
+
+### Visits
+
+```
+pending → confirmed → arrived → in_consultation → completed
+              └──────────────────────┘   (a doctor may start from confirmed)
++ cancelled (before the consultation)   + no_show (once the time has passed)
+```
+
+A trigger holds everyone but admins (and the service role) to that flow, and
+stamps `arrived_at`, `started_at`, `completed_at`. Only doctors and admins
+start or complete a consultation; a patient can cancel only while pending or
+confirmed.
+
+`public.available_slots(doctor, date, service)` returns the start times a
+booking screen may offer: the doctor's working weekday and listed times, no
+time off, not past, and nothing overlapping for the service's whole length.
+A **patient's** booking must be one of them (trigger). Staff may book off the
+grid — a walk-in squeezed in at 11:10 — but never on top of another visit.
 
 ## Tenancy
 

@@ -14,6 +14,8 @@ end;
 $$;
 
 create schema if not exists auth;
+-- Where Supabase installs extensions (btree_gist, for appointments_no_overlap).
+create schema if not exists extensions;
 
 create table auth.users (
   id                 uuid primary key default gen_random_uuid(),

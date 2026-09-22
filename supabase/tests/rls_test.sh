@@ -27,6 +27,17 @@ expect_err() { local out
   # line zsh treats that as a scalar, and [1] prints only its first character.
   else local first=${out%%$'\n'*}; print "PASS  $1  [$first]"; ((pass++)); fi }
 
+# expect_err_msg <label> <sql> <substring>  — must raise, with that message.
+# For rejections where WHICH rule refused matters: a booking guard firing
+# first would otherwise make an RLS check pass for the wrong reason.
+expect_err_msg() { local out
+  if out=$(psql $CONN -c "$2" 2>&1); then
+    print "FAIL  $1 (expected rejection, but it succeeded)"; ((fail++))
+  else local first=${out%%$'\n'*}
+    if [[ "$first" == *"$3"* ]]; then print "PASS  $1  [$first]"; ((pass++))
+    else print "FAIL  $1  expected an error containing '$3', got '$first'"; ((fail++)); fi
+  fi }
+
 # expect_ok <label> <sql>    — must succeed
 expect_ok() { local out
   if out=$(psql $CONN -c "$2" 2>&1); then print "PASS  $1"; ((pass++))
@@ -211,6 +222,12 @@ bright="set role authenticated;  set request.jwt.claim.sub = '$BRIGHT_ADMIN_AUTH
 newbie="set role authenticated;  set request.jwt.claim.sub = '$NEWBIE_AUTH';"
 anon="set role anon;"
 
+# A time a patient may actually book with Dr Santos: patients are held to
+# public.available_slots. Asked as Juan, a D-Touch patient. Bookings below
+# roll back, so one slot serves them all.
+SLOT=$(trim "$(psql $CONN -c "$juan select s from generate_series(current_date + 60, current_date + 75, interval '1 day') d,
+  lateral public.available_slots('$DR_SANTOS', d::date) s order by s limit 1;")")
+
 print "\n── RLS · patient (Juan) ───────────────────────────────────────"
 expect_eq "sees only his own 6 appointments"    "$juan select count(*) from public.appointments;" 6
 expect_eq "…spanning the three clinics he has charts at" \
@@ -250,25 +267,25 @@ expect_dml "cannot touch another patient's medical note" "$juan" \
 # Cancelling passes his RLS, so only the guard trigger stands in the way here.
 expect_err "cannot write himself a note from the doctor" \
   "$juan update public.appointments set status='cancelled', patient_note='no charge' where id='$A4';"
-expect_err "…nor book with one attached" \
+expect_err_msg "…nor book with one attached" \
   "$juan insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status,patient_note)
-   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Root Canal',now()+interval '64 days','pending','VIP');"
+   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Root Canal','$SLOT','pending','VIP');" "note to the patient"
 expect_dml "cannot touch another person's details" "$juan" \
   "update public.persons set phone='x' where id='$PERSON_MARIA' returning id" 0
 expect_dml "cannot cancel someone else's appointment" "$juan" \
   "update public.appointments set status='cancelled' where id='$A2' returning id" 0
 expect_dml "CAN book a pending appointment for himself" "$juan" \
   "insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
-   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Root Canal',now()+interval '61 days','pending') returning id" 1
-expect_err "cannot book a pre-CONFIRMED appointment" \
+   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Root Canal','$SLOT','pending') returning id" 1
+expect_err_msg "cannot book a pre-CONFIRMED appointment" \
   "$juan insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
-   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Root Canal',now()+interval '60 days','confirmed');"
-expect_err "cannot book on behalf of another patient" \
+   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Root Canal','$SLOT','confirmed');" "row-level security"
+expect_err_msg "cannot book on behalf of another patient" \
   "$juan insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
-   values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Root Canal',now()+interval '62 days','pending');"
-expect_err "cannot book at D-Touch on his ClearVision chart" \
+   values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Root Canal','$SLOT','pending');" "row-level security"
+expect_err_msg "cannot book at D-Touch on his ClearVision chart" \
   "$juan insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
-   values ('$DENTAL','$PT_JUAN_OPTO','$DR_SANTOS','Root Canal',now()+interval '63 days','pending');"
+   values ('$DENTAL','$PT_JUAN_OPTO','$DR_SANTOS','Root Canal','$SLOT','pending');" "patient_matches_clinic"
 expect_err "cannot open himself a chart at a clinic (only join_clinic can)" \
   "$juan insert into public.patients (person_id,clinic_id) values ('$PERSON_JUAN','$BRIGHT');"
 expect_dml "cannot delete his own appointment" "$juan" \
@@ -342,7 +359,7 @@ expect_err "cannot write the patient a note from the doctor" \
   "$asst update public.appointments set patient_note='x' where id='$A2';"
 # The guard fires on a CHANGE to the note, not on its presence.
 expect_dml "CAN still update a visit that carries a doctor's note" "$asst" \
-  "update public.appointments set status='confirmed' where id='$A6' returning id" 1
+  "update public.appointments set service_name=service_name where id='$A6' returning id" 1
 # The walk-in flow by hand: person first (no RETURNING), then the chart.
 expect_dml "CAN register a walk-in (person + chart) and read the chart back" \
   "$asst insert into public.persons (id,full_name,phone) values ('$WALKIN','Walk-in Test','09171110000');" \
@@ -476,7 +493,7 @@ expect_eq "…and its roster"                   "$newbie select count(*) from pu
 expect_eq "…but none of its other patients"   "$newbie select count(*) from public.persons;" 1
 expect_dml "CAN book there, as pending" "$newbie" \
   "insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at)
-   select '$DENTAL', pt.id, '$DR_SANTOS', 'Teeth Cleaning', now()+interval '100 days'
+   select '$DENTAL', pt.id, '$DR_SANTOS', 'Teeth Cleaning', '$SLOT'
    from public.patients pt returning id" 1
 
 print "\n── Onboarding · invite_staff / remove_staff ───────────────────"
@@ -717,6 +734,166 @@ expect_err "a decided request cannot be revoked" \
 expect_dml "a branch admin CAN remove the doctor they approved" \
   "$branch do \$\$ begin perform public.remove_staff('$DENTAL','$APPLICANT_AUTH'); end \$\$;" \
   "select profile_id from public.clinic_memberships where profile_id='$APPLICANT_AUTH'" 0
+
+print "\n── Visit times and overlaps ───────────────────────────────────"
+# A Monday two months out, clear of every seeded visit. Dr Santos works
+# Mon–Fri, 08:00–11:30 in half hours; Dr Reyes Mon/Wed/Fri afternoons.
+MON=$(trim "$(psql $CONN -c "select d::date from generate_series(current_date + 60, current_date + 66, interval '1 day') d where extract(isodow from d) = 1;")")
+SAT=$(trim "$(psql $CONN -c "select '$MON'::date + 5;")")
+DR_REYES='20000000-0000-0000-0000-000000000002'
+V1='7a000000-0000-0000-0000-000000000001'
+V2='7a000000-0000-0000-0000-000000000002'
+at() { print -r -- "(('$MON'::date + time '$1') at time zone 'Asia/Manila')" }
+ROOT_CANAL="(select id from public.services where clinic_id='$DENTAL' and name='Root Canal')"
+# Juan, Root Canal (90 min) with Dr Santos, Monday 09:00–10:30, confirmed.
+NEWV="insert into public.appointments (id,clinic_id,patient_id,doctor_id,service_id,service_name,scheduled_at,status)
+      values ('$V1','$DENTAL','$PT_JUAN','$DR_SANTOS',$ROOT_CANAL,'Root Canal',$(at 09:00),'confirmed');"
+# Same, but six weeks ago at an hour nothing else uses.
+PASTV="insert into public.appointments (id,clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+       values ('$V2','$DENTAL','$PT_JUAN','$DR_SANTOS','Check-up',
+               ((current_date - 42 + time '19:17') at time zone 'Asia/Manila'),'confirmed');"
+
+expect_eq "a visit lasts as long as its service (Root Canal: 90 min)" \
+  "begin; $NEWV select (extract(epoch from ends_at - scheduled_at) / 60)::int from public.appointments where id='$V1'; rollback;" 90
+expect_eq "…and the client cannot say otherwise" \
+  "begin; insert into public.appointments (id,clinic_id,patient_id,doctor_id,service_id,service_name,scheduled_at,ends_at,duration_minutes,status)
+   values ('$V1','$DENTAL','$PT_JUAN','$DR_SANTOS',$ROOT_CANAL,'Root Canal',$(at 09:00),$(at 09:05),5,'confirmed');
+   select (extract(epoch from ends_at - scheduled_at) / 60)::int from public.appointments where id='$V1'; rollback;" 90
+expect_err_msg "a 90-minute visit at 09:00 blocks 10:00 for that doctor" \
+  "begin; $NEWV insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',$(at 10:00),'confirmed');" "already has a visit"
+expect_ok "…but 10:30, when it ends, is free" \
+  "begin; $NEWV insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',$(at 10:30),'confirmed'); rollback;"
+expect_ok "…and another doctor is free at 10:00" \
+  "begin; $NEWV insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_MARIA','$DR_REYES','Check-up',$(at 10:00),'confirmed'); rollback;"
+expect_ok "cancelling a visit frees its time" \
+  "begin; $NEWV update public.appointments set status='cancelled' where id='$V1';
+   insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',$(at 09:30),'confirmed'); rollback;"
+expect_err "…and reinstating it cannot land on the visit that took its place" \
+  "begin; $NEWV update public.appointments set status='cancelled' where id='$V1';
+   insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',$(at 09:30),'confirmed');
+   update public.appointments set status='confirmed' where id='$V1';"
+
+print "\n── Visit flow ─────────────────────────────────────────────────"
+expect_dml "the front desk checks a patient in: confirmed → arrived" "$NEWV $asst" \
+  "update public.appointments set status='arrived' where id='$V1' returning id" 1
+expect_eq "…which stamps the arrival" \
+  "begin; $NEWV $asst update public.appointments set status='arrived' where id='$V1';
+   select arrived_at is not null from public.appointments where id='$V1'; rollback;" "t"
+expect_err_msg "checking in no longer completes the visit" \
+  "begin; $NEWV $asst update public.appointments set status='completed' where id='$V1';" "cannot become completed"
+expect_err_msg "the front desk cannot start a consultation" \
+  "begin; $NEWV $asst update public.appointments set status='arrived' where id='$V1';
+   update public.appointments set status='in_consultation' where id='$V1';" "Only a doctor or admin"
+expect_eq "a doctor starts it and completes it, and each step is stamped" \
+  "begin; $NEWV $doc update public.appointments set status='in_consultation' where id='$V1';
+   update public.appointments set status='completed' where id='$V1';
+   select arrived_at is not null and started_at is not null and completed_at is not null
+   from public.appointments where id='$V1'; rollback;" "t"
+expect_err_msg "a completed visit is final for the front desk" \
+  "begin; $NEWV update public.appointments set status='completed' where id='$V1';
+   $asst update public.appointments set status='confirmed' where id='$V1';" "cannot become confirmed"
+expect_dml "…but an admin may correct it" \
+  "$NEWV update public.appointments set status='completed' where id='$V1'; $dtadmin" \
+  "update public.appointments set status='confirmed' where id='$V1' returning id" 1
+expect_err_msg "a visit still to come cannot be a no-show" \
+  "begin; $NEWV $asst update public.appointments set status='no_show' where id='$V1';" "only once its time has come"
+expect_dml "…one whose time has passed can" "$PASTV $asst" \
+  "update public.appointments set status='no_show' where id='$V2' returning id" 1
+expect_ok "…and a no-show frees the time it held" \
+  "begin; $PASTV update public.appointments set status='no_show' where id='$V2';
+   insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',
+           ((current_date - 42 + time '19:17') at time zone 'Asia/Manila'),'confirmed'); rollback;"
+expect_err_msg "staff cannot create a visit that is already completed" \
+  "$asst insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',$(at 18:00),'completed');" "starts as pending"
+expect_err_msg "a patient cannot cancel once they have arrived" \
+  "begin; $NEWV update public.appointments set status='arrived' where id='$V1';
+   $juan update public.appointments set status='cancelled' where id='$V1';" "no longer be cancelled"
+expect_dml "…but can cancel a confirmed visit" "$NEWV $juan" \
+  "update public.appointments set status='cancelled' where id='$V1' returning id" 1
+
+print "\n── Availability ───────────────────────────────────────────────"
+expect_eq "a free Monday offers all 8 of Dr Santos's times" \
+  "$juan select count(*) from public.available_slots('$DR_SANTOS','$MON');" 8
+expect_eq "…in the clinic's time zone" \
+  "$juan select to_char(min(s) at time zone 'Asia/Manila','HH24:MI') from public.available_slots('$DR_SANTOS','$MON') s;" "08:00"
+expect_eq "a 09:00–10:30 visit takes 09:00, 09:30 and 10:00 off a 30-minute list" \
+  "begin; $NEWV $juan select count(*) from public.available_slots('$DR_SANTOS','$MON'); rollback;" 5
+expect_eq "…and leaves a 90-minute service only the times it fits (10:30, 11:00, 11:30)" \
+  "begin; $NEWV $juan select count(*) from public.available_slots('$DR_SANTOS','$MON',$ROOT_CANAL); rollback;" 3
+expect_eq "a clinic closure empties the day" \
+  "begin; insert into public.doctor_time_off (clinic_id,starts_on,ends_on) values ('$DENTAL','$MON','$MON');
+   $juan select count(*) from public.available_slots('$DR_SANTOS','$MON'); rollback;" 0
+expect_eq "a doctor's leave empties only their day" \
+  "begin; insert into public.doctor_time_off (clinic_id,doctor_id,starts_on,ends_on) values ('$DENTAL','$DR_SANTOS','$MON','$MON');
+   $juan select (select count(*) from public.available_slots('$DR_SANTOS','$MON')) || '/'
+             || (select count(*) from public.available_slots('$DR_REYES','$MON')); rollback;" "0/8"
+expect_eq "nothing on a day the doctor does not work" \
+  "$juan select count(*) from public.available_slots('$DR_SANTOS','$SAT');" 0
+expect_eq "nothing for an account outside the clinic" \
+  "set role authenticated; set request.jwt.claim.sub = 'aaaaaaaa-0000-0000-0000-0000000000ff';
+   select count(*) from public.available_slots('$DR_SANTOS','$MON');" 0
+expect_err "anon cannot ask" "$anon select public.available_slots('$DR_SANTOS','$MON');"
+expect_err_msg "a patient cannot book off the grid" \
+  "$juan insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at)
+   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Check-up',$(at 09:10));" "not available"
+expect_dml "…the front desk can squeeze one in" "$asst" \
+  "insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Check-up',$(at 09:10),'confirmed') returning id" 1
+expect_err_msg "a patient cannot book into a closure" \
+  "begin; insert into public.doctor_time_off (clinic_id,starts_on,ends_on) values ('$DENTAL','$MON','$MON');
+   $juan insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at)
+   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Check-up',$(at 09:00));" "not available"
+expect_err_msg "…nor into the past" \
+  "$juan insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at)
+   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Check-up',
+           ((current_date - 7 + time '09:00') at time zone 'Asia/Manila'));" "not available"
+
+print "\n── Time off ───────────────────────────────────────────────────"
+expect_dml "the front desk can see time off" \
+  "insert into public.doctor_time_off (clinic_id,starts_on,ends_on) values ('$DENTAL','$MON','$MON'); $asst" \
+  "select id from public.doctor_time_off" 1
+expect_err "…but not book any" \
+  "$asst insert into public.doctor_time_off (clinic_id,starts_on,ends_on) values ('$DENTAL','$MON','$MON');"
+expect_eq "patients cannot see it" \
+  "begin; insert into public.doctor_time_off (clinic_id,starts_on,ends_on) values ('$DENTAL','$MON','$MON');
+   $juan select count(*) from public.doctor_time_off; rollback;" 0
+expect_dml "a doctor can book their own leave" "$doc" \
+  "insert into public.doctor_time_off (clinic_id,doctor_id,starts_on,ends_on,reason)
+   values ('$DENTAL','$DR_SANTOS','$MON','$MON','Conference') returning id" 1
+expect_err "…not a colleague's" \
+  "$doc insert into public.doctor_time_off (clinic_id,doctor_id,starts_on,ends_on) values ('$DENTAL','$DR_REYES','$MON','$MON');"
+expect_dml "an admin can close the clinic for a holiday" "$dtadmin" \
+  "insert into public.doctor_time_off (clinic_id,starts_on,ends_on,reason)
+   values ('$DENTAL','$MON','$MON','Holiday') returning id" 1
+expect_err "leave cannot end before it starts" \
+  "insert into public.doctor_time_off (clinic_id,starts_on,ends_on) values ('$DENTAL','$MON','$MON'::date - 1);"
+expect_err "a doctor's leave must be at the doctor's own clinic" \
+  "insert into public.doctor_time_off (clinic_id,doctor_id,starts_on,ends_on) values ('$BRIGHT','$DR_SANTOS','$MON','$MON');"
+
+print "\n── Doctors and services ───────────────────────────────────────"
+expect_dml "a doctor can change their own working days" "$doc" \
+  "update public.doctors set available_weekdays='{1,2}' where id='$DR_SANTOS' returning id" 1
+expect_err_msg "…but cannot deactivate themselves" \
+  "$doc update public.doctors set is_active=false where id='$DR_SANTOS';" "ask an admin"
+expect_err_msg "…nor move to another clinic's roster" \
+  "$doc update public.doctors set clinic_id='$BRIGHT' where id='$DR_SANTOS';" "ask an admin"
+expect_dml "an admin can change a doctor's specialty" "$dtadmin" \
+  "update public.doctors set specialty='Endodontics' where id='$DR_SANTOS' returning id" 1
+expect_err "a time slot must be HH:MM" \
+  "update public.doctors set available_time_slots='{9am}' where id='$DR_SANTOS';"
+expect_err "a price cannot be negative" \
+  "update public.services set price=-1 where clinic_id='$DENTAL' and name='Root Canal';"
+expect_eq "the public page shows a service's price" \
+  "begin; update public.services set price=1500 where clinic_id='$DENTAL' and name='Root Canal';
+   $anon select s->>'price' from jsonb_array_elements(public.clinic_by_slug('dtouchdental')->'services') s
+   where s->>'name'='Root Canal'; rollback;" "1500.00"
 
 print "\n── RLS · anonymous ────────────────────────────────────────────"
 expect_eq "anon sees no appointments" "$anon select count(*) from public.appointments;" 0
