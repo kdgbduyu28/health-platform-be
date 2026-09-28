@@ -778,6 +778,47 @@ expect_err "…and reinstating it cannot land on the visit that took its place" 
    values ('$DENTAL','$PT_MARIA','$DR_SANTOS','Check-up',$(at 09:30),'confirmed');
    update public.appointments set status='confirmed' where id='$V1';"
 
+print "\n── One patient, one visit at a time ───────────────────────────"
+# Juan with Dr Reyes at 09:00 — off Reyes's grid, which staff may do.
+REYESV="insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+        values ('$DENTAL','$PT_JUAN','$DR_REYES','Check-up',$(at 09:00),'confirmed');"
+expect_err_msg "the front desk cannot book a patient with two doctors at once" \
+  "begin; $NEWV $asst $REYESV" "This patient already has a visit"
+expect_err_msg "…nor overlap the tail of a longer visit (Root Canal ends 10:30)" \
+  "begin; $NEWV $asst insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_JUAN','$DR_REYES','Check-up',$(at 10:00),'confirmed');" "This patient already has a visit"
+expect_ok "…but 10:30, when it ends, is free" \
+  "begin; $NEWV $asst insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_JUAN','$DR_REYES','Check-up',$(at 10:30),'confirmed'); rollback;"
+expect_ok "a cancelled visit holds none of the patient's time" \
+  "begin; $NEWV update public.appointments set status='cancelled' where id='$V1'; $asst $REYESV rollback;"
+expect_err_msg "moving another visit onto the patient's time is refused" \
+  "begin; $NEWV $asst insert into public.appointments (id,clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$V2','$DENTAL','$PT_JUAN','$DR_REYES','Check-up',$(at 14:00),'confirmed');
+   update public.appointments set scheduled_at=$(at 09:30) where id='$V2';" "This patient already has a visit"
+expect_err_msg "…and so is handing a visit to a patient who is busy then" \
+  "begin; $NEWV $asst insert into public.appointments (id,clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$V2','$DENTAL','$PT_MARIA','$DR_REYES','Check-up',$(at 09:00),'confirmed');
+   update public.appointments set patient_id='$PT_JUAN' where id='$V2';" "This patient already has a visit"
+expect_err_msg "the constraint refuses it even when the readable check is bypassed" \
+  "begin; $NEWV alter table public.appointments disable trigger appointments_set_times;
+   insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,ends_at,status)
+   values ('$DENTAL','$PT_JUAN','$DR_REYES','Check-up',$(at 09:00),$(at 09:30),'confirmed');" "appointments_no_patient_overlap"
+expect_ok "a person's chart at another clinic is a separate calendar" \
+  "begin; $NEWV insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$OPTO','$PT_JUAN_OPTO',(select id from public.doctors where clinic_id='$OPTO' limit 1),
+           'Eye Exam',$(at 09:00),'confirmed'); rollback;"
+expect_eq "a patient is not offered a time they are booked elsewhere (09:00 with Reyes)" \
+  "begin; $REYESV $juan select count(*) from public.available_slots('$DR_SANTOS','$MON'); rollback;" 7
+expect_eq "…while the front desk still sees the doctor's free times" \
+  "begin; $REYESV $asst select count(*) from public.available_slots('$DR_SANTOS','$MON'); rollback;" 8
+expect_eq "…and moving that very visit does not count against itself" \
+  "begin; $REYESV $juan select count(*) from public.available_slots('$DR_SANTOS','$MON',null,
+     (select id from public.appointments where patient_id='$PT_JUAN' and doctor_id='$DR_REYES' and scheduled_at=$(at 09:00))); rollback;" 8
+expect_err_msg "a patient booking over their own visit is refused" \
+  "begin; $REYESV $juan insert into public.appointments (clinic_id,patient_id,doctor_id,service_name,scheduled_at,status)
+   values ('$DENTAL','$PT_JUAN','$DR_SANTOS','Check-up',$(at 09:00),'pending');" "not available"
+
 print "\n── Visit flow ─────────────────────────────────────────────────"
 expect_dml "the front desk checks a patient in: confirmed → arrived" "$NEWV $asst" \
   "update public.appointments set status='arrived' where id='$V1' returning id" 1
@@ -1039,6 +1080,95 @@ expect_eq "the day's takings, by method, and what is still owed" \
 expect_eq "…which another clinic's admin cannot read" \
   "begin; $ISSUED $bright select public.billing_summary('$DENTAL', current_date - 1, current_date + 1)->>'billed'; rollback;" "0"
 
+print "\n── Marking a visit done, prices, expenses, ledger ─────────────"
+CLEANING="(select id from public.services where clinic_id='$DENTAL' and name='Teeth Cleaning')"
+PRICES="update public.services set price=1500 where id=$ROOT_CANAL; update public.services set price=800 where id=$CLEANING;"
+# Root Canal once, Teeth Cleaning twice: ₱1,500 + 2 × ₱800.
+DONE_WITH="jsonb_build_array(jsonb_build_object('service_id',$ROOT_CANAL),
+                             jsonb_build_object('service_id',$CLEANING,'quantity',2))"
+COMPLETE="do \$\$ begin perform public.complete_visit('$V1', $DONE_WITH); end \$\$;"
+expect_dml "the front desk marks a checked-in visit done" \
+  "$NEWV $asst update public.appointments set status='arrived' where id='$V1';" \
+  "update public.appointments set status='completed' where id='$V1' returning id" 1
+expect_err_msg "…but still cannot start a consultation" \
+  "begin; $NEWV $asst update public.appointments set status='arrived' where id='$V1';
+   update public.appointments set status='in_consultation' where id='$V1';" "Only a doctor or admin"
+expect_eq "marking done with services checks the patient in, completes the visit and bills what was done" \
+  "begin; $PRICES $NEWV $asst $COMPLETE
+   select a.status || '/' || (a.arrived_at is not null) || '/' || v.status || '/' || v.subtotal || '/'
+          || (select count(*) from public.invoice_items i where i.invoice_id = v.id)
+   from public.appointments a join public.invoices v on v.appointment_id = a.id
+   where a.id='$V1'; rollback;" "completed/true/draft/3100.00/2"
+expect_eq "a doctor can do it too, though they cannot bill" \
+  "begin; $PRICES $NEWV $doc $COMPLETE reset role;
+   select total from public.invoices where appointment_id='$V1'; rollback;" "3100.00"
+expect_eq "no services, no bill" \
+  "begin; $NEWV $doc select public.complete_visit('$V1') is null; rollback;" "t"
+expect_eq "doing it again corrects the service lines and keeps lines typed by hand" \
+  "begin; $PRICES $NEWV $asst $COMPLETE
+   insert into public.invoice_items (invoice_id,clinic_id,description,unit_price) values ($BILL,'$DENTAL','X-ray',300);
+   do \$\$ begin perform public.complete_visit('$V1', jsonb_build_array(jsonb_build_object('service_id',$ROOT_CANAL))); end \$\$;
+   select subtotal from public.invoices where id=$BILL; rollback;" "1800.00"
+expect_eq "…but leaves an issued bill alone" \
+  "begin; $PRICES $NEWV $asst $COMPLETE do \$\$ begin perform public.issue_invoice($BILL); end \$\$;
+   do \$\$ begin perform public.complete_visit('$V1', '[]'); end \$\$;
+   select status || '/' || total from public.invoices where id=$BILL; rollback;" "issued/3100.00"
+expect_err_msg "a visit still pending cannot be marked done" \
+  "begin; $NEWV update public.appointments set status='pending' where id='$V1'; $asst $COMPLETE" "cannot be marked as done"
+expect_err_msg "another clinic's service is refused" \
+  "begin; $NEWV $asst select public.complete_visit('$V1', jsonb_build_array(jsonb_build_object('service_id',
+     (select id from public.services where clinic_id <> '$DENTAL' limit 1))));" "not offered here"
+expect_err_msg "another clinic cannot mark it done" \
+  "begin; $NEWV $bright $COMPLETE" "not found"
+expect_err_msg "…nor can the patient" \
+  "begin; $NEWV $juan $COMPLETE" "not found"
+expect_eq "the front desk sets a price" \
+  "begin; $asst do \$\$ begin perform public.set_service_price($ROOT_CANAL, 1750.5); end \$\$; reset role;
+   select price from public.services where id=$ROOT_CANAL; rollback;" "1750.50"
+expect_dml "…but changes nothing else about the service" "$asst" \
+  "update public.services set name='Renamed' where id=$ROOT_CANAL returning id" 0
+expect_err_msg "…and not below zero" \
+  "begin; $asst select public.set_service_price($ROOT_CANAL, -1);" "from 0 up"
+expect_err_msg "a doctor does not set prices" \
+  "begin; $doc select public.set_service_price($ROOT_CANAL, 1);" "not found"
+expect_err_msg "…nor does another clinic" \
+  "begin; $bright select public.set_service_price($ROOT_CANAL, 1);" "not found"
+
+SPEND="insert into public.expenses (clinic_id,category,amount,method) values ('$DENTAL','Supplies',200,'cash');"
+expect_eq "the front desk records an expense, as themselves" \
+  "begin; $asst $SPEND reset role; select category || '/' || amount || '/' || (created_by = '$ASST_AUTH')
+   from public.expenses; rollback;" "Supplies/200.00/true"
+expect_err_msg "not dated in the future" \
+  "begin; $asst insert into public.expenses (clinic_id,category,amount,spent_on) values ('$DENTAL','Rent',1,current_date + 3);" "future"
+expect_err "a doctor cannot record one" "begin; $doc $SPEND"
+expect_eq "…nor see them" "begin; $asst $SPEND $doc select count(*) from public.expenses; rollback;" 0
+expect_eq "another clinic sees none" "begin; $asst $SPEND $bright select count(*) from public.expenses; rollback;" 0
+expect_dml "an expense cannot be edited" "$asst $SPEND" \
+  "update public.expenses set amount=1 returning id" 0
+expect_err_msg "the front desk cannot void one" \
+  "begin; $asst $SPEND select public.void_expense((select id from public.expenses), 'typo');" "Only an admin"
+expect_eq "an admin can, with a reason" \
+  "begin; $asst $SPEND $dtadmin do \$\$ begin perform public.void_expense((select id from public.expenses), 'Duplicate'); end \$\$;
+   select void_reason from public.expenses; rollback;" "Duplicate"
+
+LEDGER_DAY="$ISSUED insert into public.payments (invoice_id,clinic_id,amount,method) values ($BILL,'$DENTAL',500,'bpi'); $SPEND"
+expect_eq "the ledger: gross, paid, pending, expenses and net" \
+  "begin; $LEDGER_DAY
+   select s->>'gross' || '/' || (s->>'paid') || '/' || (s->>'pending') || '/' || (s->>'expenses') || '/'
+          || (s->>'net') || '/' || (s->'by_method'->>'bpi') || '/' || (s->'by_category'->>'Supplies')
+   from public.ledger_summary('$DENTAL', current_date - 1, current_date + 1) s; rollback;" \
+  "1500.00/500.00/1000.00/200.00/300.00/500.00/200.00"
+expect_eq "…with the payment and the expense behind it" \
+  "begin; $LEDGER_DAY select string_agg(kind || ':' || amount, ',' order by kind)
+   from public.ledger_entries('$DENTAL', current_date - 1, current_date + 1); rollback;" "expense:200.00,payment:500.00"
+expect_eq "a voided expense leaves the totals" \
+  "begin; $LEDGER_DAY $dtadmin do \$\$ begin perform public.void_expense((select id from public.expenses), 'x'); end \$\$;
+   select public.ledger_summary('$DENTAL', current_date - 1, current_date + 1)->>'net'; rollback;" "500.00"
+expect_err_msg "a doctor cannot read the ledger" \
+  "begin; $doc select public.ledger_summary('$DENTAL', current_date, current_date);" "front desk and admins"
+expect_err_msg "…nor another clinic's admin" \
+  "begin; $bright select public.ledger_entries('$DENTAL', current_date, current_date);" "front desk and admins"
+
 print "\n── Notifications ──────────────────────────────────────────────"
 FRONT_DESK=$(trim "$(psql $CONN -c "select count(*) from public.clinic_memberships where clinic_id='$DENTAL' and role in ('assistant','admin');")")
 N="public.notifications"
@@ -1112,6 +1242,36 @@ expect_eq "a visit booked just now is not reminded about" \
   "begin; $CLEAR_REYES $SOON update public.appointments set created_at=now() where id='$V2';
    select private.send_visit_reminders(); rollback;" 0
 
+print "\n── Notification preferences ───────────────────────────────────"
+MUTES='public.notification_mutes'
+JUAN_MUTES_CONFIRMED="$juan insert into $MUTES (profile_id,app,kind) values ('$JUAN_AUTH','patient','visit_confirmed'); reset role;"
+expect_eq "a muted kind is not written for that account" \
+  "begin; $JUAN_MUTES_CONFIRMED $JUAN_BOOKS $asst update public.appointments set status='confirmed' where id='$V1';
+   reset role; select count(*) from $N where profile_id='$JUAN_AUTH'; rollback;" 0
+expect_eq "…other kinds still are" \
+  "begin; $JUAN_MUTES_CONFIRMED $NEWV $asst update public.appointments set status='cancelled' where id='$V1';
+   reset role; select kind from $N where profile_id='$JUAN_AUTH'; rollback;" "visit_cancelled"
+expect_eq "…and a mute in one app leaves the others alone" \
+  "begin; $asst insert into $MUTES (profile_id,app,kind) values ('$ASST_AUTH','patient','booking_requested');
+   $JUAN_BOOKS reset role; select count(*) from $N where kind='booking_requested'; rollback;" "$FRONT_DESK"
+expect_eq "a front desk mute stops only that account's copy" \
+  "begin; $asst insert into $MUTES (profile_id,app,kind) values ('$ASST_AUTH','assistant','booking_requested');
+   $JUAN_BOOKS reset role; select count(*) from $N where kind='booking_requested'; rollback;" "$((FRONT_DESK - 1))"
+expect_eq "turning it back on is a delete" \
+  "begin; $JUAN_MUTES_CONFIRMED $juan delete from $MUTES where kind='visit_confirmed';
+   $JUAN_BOOKS $asst update public.appointments set status='confirmed' where id='$V1';
+   reset role; select count(*) from $N where profile_id='$JUAN_AUTH'; rollback;" 1
+expect_err "nobody mutes for someone else" \
+  "$juan insert into $MUTES (profile_id,app,kind) values ('$ASST_AUTH','assistant','booking_requested');"
+expect_eq "nobody reads someone else's mutes" \
+  "begin; $JUAN_MUTES_CONFIRMED $asst select count(*) from $MUTES; rollback;" 0
+expect_dml "…nor deletes them" \
+  "$JUAN_MUTES_CONFIRMED $asst" "delete from $MUTES returning kind" 0
+expect_err "an unknown kind is refused" \
+  "$juan insert into $MUTES (profile_id,app,kind) values ('$JUAN_AUTH','patient','spam');"
+expect_err "anon cannot mute" \
+  "$anon insert into $MUTES (profile_id,app,kind) values ('$JUAN_AUTH','patient','visit_reminder');"
+
 print "\n── Push subscriptions ─────────────────────────────────────────"
 SUB="do \$\$ begin perform public.save_push_subscription('patient','https://push.example/abc','key','secret'); end \$\$;"
 expect_eq "a browser subscribes for the signed-in account" \
@@ -1131,6 +1291,54 @@ expect_err_msg "only a real push endpoint is accepted" \
   "$juan select public.save_push_subscription('patient','http://evil.example/','k','s');" "not a push subscription"
 expect_err "anon cannot subscribe" \
   "$anon select public.save_push_subscription('patient','https://push.example/x','k','s');"
+
+print "\n── Calendar feed ──────────────────────────────────────────────"
+FEEDS='public.calendar_feeds'
+JUAN_FEED="$juan do \$\$ begin perform public.my_calendar_feed_token(); end \$\$; reset role;
+           do \$\$ begin perform set_config('t.tok', (select token from $FEEDS
+             where profile_id='$JUAN_AUTH'), true); end \$\$;"
+AS_SVC="set role service_role;"
+JUAN_FEED_ROWS=$(trim "$(psql $CONN -c "select count(*) from public.appointments a
+  join public.patients pt on pt.id=a.patient_id join public.persons pe on pe.id=pt.person_id
+  where pe.profile_id='$JUAN_AUTH' and a.status not in ('cancelled','no_show')
+    and a.scheduled_at >= now() - interval '90 days';")")
+JUAN_FEED_CLINICS=$(trim "$(psql $CONN -c "select count(distinct a.clinic_id) from public.appointments a
+  join public.patients pt on pt.id=a.patient_id join public.persons pe on pe.id=pt.person_id
+  where pe.profile_id='$JUAN_AUTH' and a.status not in ('cancelled','no_show')
+    and a.scheduled_at >= now() - interval '90 days';")")
+expect_eq "a patient gets a long random feed token" \
+  "begin; $juan select public.my_calendar_feed_token() ~ '^[0-9a-f]{64}\$'; rollback;" "t"
+expect_eq "…the same one each time they ask" \
+  "begin; $juan select public.my_calendar_feed_token() = public.my_calendar_feed_token(); rollback;" "t"
+expect_eq "…and a new one when they reset it" \
+  "begin; $JUAN_FEED $juan select public.reset_calendar_feed_token() <> current_setting('t.tok'); rollback;" "t"
+expect_err_msg "…after which the old URL is dead" \
+  "begin; $JUAN_FEED $juan do \$\$ begin perform public.reset_calendar_feed_token(); end \$\$;
+   $AS_SVC select * from public.calendar_feed_events(current_setting('t.tok'));" "No such calendar feed"
+expect_err_msg "an unknown token is refused" \
+  "$AS_SVC select * from public.calendar_feed_events('0000');" "No such calendar feed"
+expect_eq "the feed lists every live visit of the account (seed has some)" \
+  "begin; $JUAN_FEED $AS_SVC select count(*) from public.calendar_feed_events(current_setting('t.tok')); rollback;" "$JUAN_FEED_ROWS"
+expect_eq "…across all of the person's clinics" \
+  "begin; $JUAN_FEED $AS_SVC select count(distinct clinic_slug) from public.calendar_feed_events(current_setting('t.tok')); rollback;" "$JUAN_FEED_CLINICS"
+expect_eq "…with the doctor and the clinic's slug for each" \
+  "begin; $JUAN_FEED $AS_SVC select count(*) from public.calendar_feed_events(current_setting('t.tok'))
+   where doctor_name is null or clinic_slug is null; rollback;" 0
+expect_eq "a cancelled visit drops out of it" \
+  "begin; $JUAN_FEED update public.appointments set status='cancelled' where id=(
+     select a.id from public.appointments a where a.patient_id='$PT_JUAN'
+        and a.status in ('pending','confirmed') and a.scheduled_at > now() limit 1);
+   $AS_SVC select count(*) from public.calendar_feed_events(current_setting('t.tok')); rollback;" "$((JUAN_FEED_ROWS - 1))"
+expect_eq "reading the feed stamps when it was last read" \
+  "begin; $JUAN_FEED $AS_SVC do \$\$ begin perform public.calendar_feed_events(current_setting('t.tok')); end \$\$;
+   reset role; select last_fetched_at is not null from $FEEDS where profile_id='$JUAN_AUTH'; rollback;" "t"
+expect_eq "nobody reads another account's token" \
+  "begin; $JUAN_FEED $asst select count(*) from $FEEDS; rollback;" 0
+expect_err "a signed-in user cannot read feeds directly" \
+  "$juan select * from public.calendar_feed_events('x');"
+expect_err "…nor can anon" \
+  "$anon select * from public.calendar_feed_events('x');"
+expect_err "anon has no feed token" "$anon select public.my_calendar_feed_token();"
 
 print "\n── RLS · anonymous ────────────────────────────────────────────"
 expect_eq "anon sees no appointments" "$anon select count(*) from public.appointments;" 0
@@ -1177,6 +1385,689 @@ expect_err "…nor a two-letter slug" \
 # A column privilege, so this one raises rather than matching zero rows.
 expect_err "an admin still cannot change their clinic's slug" \
   "$dtadmin update public.clinics set slug='mine' where id='$DENTAL';"
+
+print "\n── Dental charting ────────────────────────────────────────────"
+DENT_NEW="insert into public.dental_chart_entries (clinic_id,patient_id,appointment_id,tooth,surfaces,code,status)"
+expect_eq "the dental vertical charts teeth; the others do not" \
+  "select string_agg(slug || '=' || coalesce(chart_kind,'-'), ',' order by slug) from public.clinic_types;" \
+  "dental=dental,optometry=-,pedia=-"
+expect_eq "seeded: 7 entries at D-Touch, 1 at BrightSmile" \
+  "select count(*) filter (where clinic_id='$DENTAL') || '/' || count(*) filter (where clinic_id='$BRIGHT')
+   from public.dental_chart_entries;" "7/1"
+expect_eq "the doctor reads D-Touch's 7 entries" \
+  "$doc select count(*) from public.dental_chart_entries;" 7
+expect_eq "…with their notes" \
+  "$doc select note from public.dental_chart_entries where tooth=46 and code='caries';" \
+  "Deep, close to the pulp"
+expect_eq "the front desk reads them too (to bill and book the follow-up)" \
+  "$asst select count(*) from public.dental_chart_entries;" 7
+expect_eq "BrightSmile's admin reads only their own tenant's entry" \
+  "$bright select count(*) from public.dental_chart_entries;" 1
+expect_eq "a patient has no direct read of the table" \
+  "$juan select count(*) from public.dental_chart_entries;" 0
+expect_eq "…but reads his own chart through patient_dental_chart" \
+  "$juan select count(*) from public.patient_dental_chart('$PT_JUAN');" 5
+expect_eq "…which leaves the notes out" \
+  "$juan select count(*) from information_schema.routines r
+   join information_schema.parameters p on p.specific_name = r.specific_name
+   where r.routine_name='patient_dental_chart' and p.parameter_mode='OUT' and p.parameter_name='note';" 0
+expect_eq "…and returns nothing for someone else's chart" \
+  "$juan select count(*) from public.patient_dental_chart('$PT_MARIA');" 0
+expect_eq "…nor for anyone who is not a patient there" \
+  "$doc select count(*) from public.patient_dental_chart('$PT_JUAN');" 0
+expect_err "anon cannot call it" \
+  "$anon select * from public.patient_dental_chart('$PT_JUAN');"
+
+expect_dml "the doctor CAN chart a finding at a visit" "$doc" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN','$A6',17,'{D,M,D}','caries','existing') returning id" 1
+expect_eq "…surfaces come back sorted, once each" \
+  "begin; $doc $DENT_NEW values ('$DENTAL','$PT_JUAN','$A6',17,'{O,D,M,D}','caries','existing');
+   select array_to_string(surfaces, '') from public.dental_chart_entries where tooth=17; rollback;" "DMO"
+expect_eq "…and the author is the session, not the client" \
+  "begin; $doc insert into public.dental_chart_entries (clinic_id,patient_id,tooth,code,status,created_by)
+   values ('$DENTAL','$PT_JUAN',17,'crown','planned','$ASST_AUTH');
+   select created_by = '$DOC_AUTH' from public.dental_chart_entries where tooth=17; rollback;" "t"
+expect_dml "the admin CAN plan treatment outside a visit" "$dtadmin" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN',null,21,'{}','crown','planned') returning id" 1
+expect_dml "a primary tooth (FDI 85) is a tooth" "$doc" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN',null,85,'{}','sealant','planned') returning id" 1
+expect_err "the front desk cannot chart" \
+  "$asst $DENT_NEW values ('$DENTAL','$PT_JUAN','$A6',17,'{}','crown','planned');"
+expect_dml "…nor change an entry" "$asst" \
+  "update public.dental_chart_entries set note='x' returning id" 0
+expect_dml "…nor delete one" "$asst" \
+  "delete from public.dental_chart_entries returning id" 0
+expect_err "a patient cannot chart his own teeth" \
+  "$juan $DENT_NEW values ('$DENTAL','$PT_JUAN',null,17,'{}','crown','planned');"
+expect_err "BrightSmile cannot chart on D-Touch's patient" \
+  "$bright $DENT_NEW values ('$DENTAL','$PT_MARIA',null,17,'{}','crown','planned');"
+expect_dml "…nor touch D-Touch's entries" "$bright" \
+  "update public.dental_chart_entries set note='x' where clinic_id='$DENTAL' returning id" 0
+expect_err_msg "an eye clinic keeps no dental chart" \
+  "$DENT_NEW values ('$OPTO','$PT_JUAN_OPTO',null,11,'{}','crown','planned');" \
+  "does not keep a dental chart"
+expect_err "tooth 19 does not exist" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN',null,19,'{}','crown','planned');"
+expect_err "nor does primary tooth 56" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN',null,56,'{}','crown','planned');"
+expect_err "an unknown surface is refused" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN',null,17,'{X}','filling','planned');"
+expect_err "surfaces on a crown mean nothing" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN',null,17,'{O}','crown','planned');"
+expect_err "a condition cannot be planned" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN',null,17,'{}','caries','planned');"
+expect_err "a found gap is 'missing', not an existing extraction" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN',null,17,'{}','extraction','existing');"
+expect_err "work done needs the visit it was done at" \
+  "$DENT_NEW values ('$DENTAL','$PT_JUAN',null,17,'{}','crown','done');"
+expect_err_msg "…a visit the patient attended, not a pending one" \
+  "$doc $DENT_NEW values ('$DENTAL','$PT_JUAN','$A4',46,'{}','root_canal','done');" \
+  "only at a visit the patient attended"
+expect_err "an entry cannot hang off another patient's visit" \
+  "$DENT_NEW values ('$DENTAL','$PT_MARIA','$A6',17,'{}','crown','planned');"
+expect_dml "the doctor CAN carry out the plan at an attended visit" "$doc" \
+  "update public.dental_chart_entries set status='done', appointment_id='$A6'
+   where id='60000000-0000-0000-0000-000000000004' returning id" 1
+expect_dml "the doctor CAN take back a mistaken entry" "$doc" \
+  "delete from public.dental_chart_entries where id='60000000-0000-0000-0000-000000000005' returning id" 1
+expect_eq "deleting a visit keeps its entries on the chart" \
+  "begin;
+   delete from public.appointments where id='$A7';
+   select count(*) from public.dental_chart_entries
+   where id='60000000-0000-0000-0000-000000000007' and appointment_id is null; rollback;" 1
+
+print "\n── Patient search ─────────────────────────────────────────────"
+# Earlier sections add charts at D-Touch, so count rather than assume.
+DT_CHARTS=$(trim "$(psql $CONN -c "select count(*) from public.patients where clinic_id='$DENTAL';")")
+expect_eq "the front desk pages through D-Touch's charts, two at a time" \
+  "$asst select (r->>'total') || ':' || jsonb_array_length(r->'patients')
+   from public.search_patients('$DENTAL', null, 2, 0) r;" "$DT_CHARTS:2"
+expect_eq "…and the pages add up to the whole list" \
+  "$asst select sum(jsonb_array_length(r->'patients'))
+   from generate_series(0, $DT_CHARTS, 2) o, public.search_patients('$DENTAL', null, 2, o) r;" "$DT_CHARTS"
+expect_eq "…sorted by name" \
+  "$asst select string_agg(p->'person'->>'full_name', ',' order by n)
+   from public.search_patients('$DENTAL') r,
+        jsonb_array_elements(r->'patients') with ordinality as x(p, n);" \
+  "$(trim "$(psql $CONN -c "select string_agg(pe.full_name, ',' order by lower(pe.full_name), pt.id)
+     from public.patients pt join public.persons pe on pe.id=pt.person_id where pt.clinic_id='$DENTAL';")")"
+expect_eq "search by part of the name" \
+  "$asst select r->>'total' from public.search_patients('$DENTAL', 'juan') r;" 1
+expect_eq "search by phone, however it is typed" \
+  "$asst select r->>'total' from public.search_patients('$DENTAL',
+     (select '+63 ' || substr(regexp_replace(pe.phone,'[^0-9]','','g'), 2)
+      from public.persons pe where pe.id='$PERSON_JUAN')) r;" 1
+expect_eq "a % is a character, not a wildcard" \
+  "$asst select r->>'total' from public.search_patients('$DENTAL', '%') r;" 0
+expect_eq "carries each chart's completed visits" \
+  "$asst select p->>'completed_visits' from public.search_patients('$DENTAL', 'juan') r,
+     jsonb_array_elements(r->'patients') p;" 1
+expect_eq "…and its next visit" \
+  "$asst select (p->>'next_visit_at') is not null from public.search_patients('$DENTAL', 'juan') r,
+     jsonb_array_elements(r->'patients') p;" "t"
+expect_eq "another tenant's staff get an empty page" \
+  "$bright select r->>'total' from public.search_patients('$DENTAL') r;" 0
+expect_eq "…and so does a patient" \
+  "$juan select r->>'total' from public.search_patients('$DENTAL', 'maria') r;" 0
+expect_err "anon cannot search" \
+  "$anon select public.search_patients('$DENTAL');"
+
+print "\n── Patient list: remarks, filters, sorting ────────────────────"
+# <expr> over one chart's row in the list, as the front desk (or $3) sees it.
+row() { print -r -- "${3:-$asst} select $2 from public.search_patients('$DENTAL', '$1') r,
+  jsonb_array_elements(r->'patients') p;" }
+# As the database owner, with triggers off, to set a scene the flow forbids.
+SCENE="reset role; set local session_replication_role = replica;"
+MARIA_DONE="update public.appointments set status='cancelled'
+  where patient_id='$PT_MARIA' and scheduled_at > now();"
+expect_eq "the counts cover the whole search" \
+  "$asst select r->'counts'->>'all' from public.search_patients('$DENTAL') r;" "$DT_CHARTS"
+expect_eq "first and last visit are the same when there was one" \
+  "$(row juan "p->>'first_visit_at' = p->>'last_visit_at'")" "t"
+expect_eq "…with who saw them and for what" \
+  "$(row juan "p->>'last_visit_doctor' is not null and p->>'last_visit_service' is not null")" "t"
+expect_eq "nothing owed: no balance remark" \
+  "$(row juan "(p->>'balance') || '/' || (p->'flags' ? 'balance')")" "0/false"
+expect_eq "an issued bill is owed, and flagged" \
+  "begin; $ISSUED $(row juan "(p->>'balance') || '/' || (p->'flags' ? 'balance')") rollback;" "1500.00/true"
+expect_eq "…which the doctor sees too" \
+  "begin; $ISSUED $(row juan "p->>'balance'" "$doc") rollback;" "1500.00"
+expect_eq "a draft bill is not owed yet" \
+  "begin; $HERE_V $asst $MAKE_BILL $(row juan "p->>'balance'") rollback;" "0"
+expect_eq "unpaid 30 days after issue needs attention" \
+  "begin; $ISSUED $SCENE update public.invoices set issued_at = now() - interval '40 days' where id=$BILL;
+   $(row juan "p->'attention'") rollback;" '["overdue_balance"]'
+expect_eq "…not before" \
+  "begin; $ISSUED $(row juan "p->'attention'") rollback;" '[]'
+expect_eq "no phone and no email: no way to reach them" \
+  "begin; $SCENE update public.persons set phone='', email=null where id='$PERSON_MARIA';
+   $asst select count(*) from public.search_patients('$DENTAL', null, 30, 0, '{no_contact}') r,
+     jsonb_array_elements(r->'patients') p where p->>'id'='$PT_MARIA'; rollback;" 1
+expect_eq "seen 8 months ago with nothing booked: due for recall" \
+  "begin; $SCENE $MARIA_DONE update public.appointments set scheduled_at = now() - interval '8 months'
+   where patient_id='$PT_MARIA' and status='completed';
+   $(row maria "p->'flags' ? 'recall'") rollback;" "t"
+expect_eq "…not at a clinic that recalls yearly" \
+  "begin; $SCENE $MARIA_DONE update public.appointments set scheduled_at = now() - interval '8 months'
+   where patient_id='$PT_MARIA' and status='completed';
+   update public.clinics set recall_months=12 where id='$DENTAL';
+   $(row maria "p->'flags' ? 'recall'") rollback;" "f"
+expect_eq "…nor with a visit booked" \
+  "$(row juan "p->'flags' ? 'recall'")" "f"
+expect_eq "a last visit missed needs attention" \
+  "begin; $SCENE $MARIA_DONE update public.appointments set status='no_show' where id='$A7';
+   $(row maria "p->'attention'") rollback;" '["no_show"]'
+expect_eq "planned work and nothing booked needs attention" \
+  "begin; $SCENE $MARIA_DONE insert into public.dental_chart_entries
+     (clinic_id,patient_id,appointment_id,tooth,surfaces,code,status)
+     values ('$DENTAL','$PT_MARIA',null,17,'{}','crown','planned');
+   $(row maria "p->'attention' ? 'unbooked_plan'") rollback;" "t"
+expect_eq "under 18 is pedia" \
+  "begin; $SCENE update public.persons set date_of_birth = current_date - interval '10 years'
+   where id='$PERSON_MARIA';
+   $(row maria "(p->>'age') || '/' || (p->'flags' ? 'pedia') || '/' || (p->'flags' ? 'adult')") rollback;" "10/true/false"
+expect_eq "every filter must hold: pedia and adult is no one" \
+  "$asst select r->>'total' from public.search_patients('$DENTAL', null, 30, 0, '{pedia,adult}') r;" 0
+expect_eq "…and the counts still cover the whole search" \
+  "$asst select r->'counts'->>'all' from public.search_patients('$DENTAL', null, 30, 0, '{pedia,adult}') r;" "$DT_CHARTS"
+expect_eq "sorts by name, backwards" \
+  "$asst select r->'patients'->0->'person'->>'full_name'
+   from public.search_patients('$DENTAL', null, 1, 0, null, 'name', true) r;" \
+  "$(trim "$(psql $CONN -c "select pe.full_name from public.patients pt join public.persons pe on pe.id=pt.person_id
+     where pt.clinic_id='$DENTAL' order by lower(pe.full_name) desc, pt.id limit 1;")")"
+expect_eq "sorts by most visits" \
+  "$asst select r->'patients'->0->>'completed_visits'
+   from public.search_patients('$DENTAL', null, 1, 0, null, 'visits', true) r;" \
+  "$(trim "$(psql $CONN -c "select max(c) from (select count(*) filter (where a.status='completed') c
+     from public.patients pt left join public.appointments a on a.patient_id=pt.id
+     where pt.clinic_id='$DENTAL' group by pt.id) x;")")"
+expect_eq "…and the sorted pages still add up" \
+  "$asst select sum(jsonb_array_length(r->'patients'))
+   from generate_series(0, $DT_CHARTS, 2) o,
+        public.search_patients('$DENTAL', null, 2, o, null, 'last_visit', true) r;" "$DT_CHARTS"
+expect_err "an admin sets the recall interval within reason" \
+  "$dtadmin update public.clinics set recall_months=0 where id='$DENTAL';"
+expect_dml "…and may set it" "$dtadmin" \
+  "update public.clinics set recall_months=12 where id='$DENTAL' returning id" 1
+
+print "\n── Patient information form ───────────────────────────────────"
+INTAKE="'{\"under_treatment\":false,\"takes_medications\":true,\"medications\":\" Losartan 50mg \",
+  \"allergies\":[\"penicillin\",\"latex\"],\"conditions\":[\"high_blood_pressure\"],
+  \"signed_name\":\"Ana Cruz\",\"consent\":true}'::jsonb"
+ANA="'{\"full_name\":\" Ana Cruz \",\"phone\":\"0917 555 0101\",\"date_of_birth\":\"1990-04-02\",
+  \"sex\":\"female\",\"emergency_contact_name\":\"Ben Cruz\",\"emergency_contact_phone\":\"0917 555 0102\"}'::jsonb"
+REGISTER_ANA="public.register_patient('$DENTAL', $ANA, $INTAKE, 'front_desk_tablet')"
+expect_eq "the front desk registers a patient with their form, no visit needed" \
+  "begin; $asst select count(*) from (select $REGISTER_ANA) x; reset role;
+   select pe.full_name || '|' || pe.sex || '|' || i.source || '|' || i.medications || '|'
+          || array_to_string(i.allergies, ',') || '|' || (i.consent_at is not null)
+     from public.patient_intakes i
+     join public.patients pt on pt.id = i.patient_id
+     join public.persons pe on pe.id = pt.person_id
+    where pe.full_name = 'Ana Cruz';
+   rollback;" \
+  $'1\nAna Cruz|female|front_desk_tablet|Losartan 50mg|penicillin,latex|true'
+expect_eq "…and can read what they just registered" \
+  "begin; $asst create temp table t as select $REGISTER_ANA as id;
+   select pe.emergency_contact_name from public.patients pt
+     join public.persons pe on pe.id = pt.person_id where pt.id = (select id from t);
+   rollback;" "Ben Cruz"
+expect_ok "a form is optional: registering can be just who they are" \
+  "begin; $asst select public.register_patient('$DENTAL', '{\"full_name\":\"Quick Add\",\"phone\":\"0917 555 0199\"}'); rollback;"
+expect_err_msg "registering needs a phone number" \
+  "$asst select public.register_patient('$DENTAL', '{\"full_name\":\"No Phone\"}');" \
+  "phone is required"
+expect_err_msg "…and the privacy consent, when a form comes with it" \
+  "$asst select public.register_patient('$DENTAL', $ANA,
+     '{\"under_treatment\":false,\"takes_medications\":false,\"signed_name\":\"Ana\"}');" \
+  "privacy consent"
+expect_err_msg "the yes/no questions must be answered" \
+  "$asst select public.register_patient('$DENTAL', $ANA, '{\"signed_name\":\"Ana\",\"consent\":true}');" \
+  "under treatment"
+expect_err "an allergy that is not on the list goes in 'other'" \
+  "$asst select public.register_patient('$DENTAL', $ANA,
+     '{\"under_treatment\":false,\"takes_medications\":false,\"allergies\":[\"cats\"],
+       \"signed_name\":\"Ana\",\"consent\":true}');"
+expect_err "an unknown sex value is refused" \
+  "$asst select public.register_patient('$DENTAL',
+     '{\"full_name\":\"X\",\"phone\":\"0917 555 0100\",\"sex\":\"x\"}');"
+expect_err_msg "the patient app does not register patients" \
+  "$asst select public.register_patient('$DENTAL', $ANA, $INTAKE, 'patient_app');" \
+  "join a clinic"
+expect_err "a doctor does not register patients" \
+  "$doc select public.register_patient('$DENTAL', $ANA, $INTAKE);"
+expect_err "nor does another clinic's admin, at this clinic" \
+  "$bright select public.register_patient('$DENTAL', $ANA, $INTAKE);"
+expect_err "anon cannot register anyone" \
+  "$anon select public.register_patient('$DENTAL', $ANA, $INTAKE);"
+
+expect_ok "a patient fills in their own form in the patient app" \
+  "$juan select public.save_patient_intake('$PT_JUAN',
+     '{\"sex\":\"male\",\"address\":\"Makati\"}', $INTAKE, 'patient_app');"
+expect_eq "…which updates who they are without blanking what the form left out" \
+  "select pe.sex || '|' || pe.address || '|' || (pe.phone is not null)
+   from public.persons pe where pe.id='$PERSON_JUAN';" "male|Makati|true"
+expect_eq "…and they can read it back" \
+  "$juan select source from public.patient_intakes where patient_id='$PT_JUAN';" "patient_app"
+expect_eq "the front desk sees it too" \
+  "$asst select medications from public.patient_intakes where patient_id='$PT_JUAN';" "Losartan 50mg"
+expect_eq "…and the doctor" \
+  "$doc select array_to_string(conditions, ',') from public.patient_intakes where patient_id='$PT_JUAN';" \
+  "high_blood_pressure"
+expect_eq "another clinic's staff do not" \
+  "$bright select count(*) from public.patient_intakes where patient_id='$PT_JUAN';" 0
+expect_eq "…nor does another patient" \
+  "begin; $asst select count(*) from (select public.save_patient_intake('$PT_MARIA', '{}', $INTAKE, 'staff')) x;
+   $juan select count(*) from public.patient_intakes where patient_id='$PT_MARIA'; rollback;" $'1\n0'
+expect_eq "Juan's form at D-Touch is not his form at ClearVision" \
+  "$juan select count(*) from public.patient_intakes where patient_id='$PT_JUAN_OPTO';" 0
+expect_err_msg "a patient cannot fill in someone else's form" \
+  "$juan select public.save_patient_intake('$PT_MARIA', '{}', $INTAKE, 'patient_app');" \
+  "no such patient"
+expect_err_msg "…nor pass their own answers off as the front desk's" \
+  "$juan select public.save_patient_intake('$PT_JUAN', '{}', $INTAKE, 'staff');" \
+  "only this clinic's staff"
+expect_err_msg "a name cannot be blanked" \
+  "$juan select public.save_patient_intake('$PT_JUAN', '{\"full_name\":\" \"}', $INTAKE, 'patient_app');" \
+  "name is required"
+expect_ok "the front desk updates a walk-in's form on the tablet" \
+  "$asst select public.save_patient_intake('$PT_MARIA', '{\"address\":\"Pasig\"}', $INTAKE, 'front_desk_tablet');"
+expect_eq "…one form per chart: saving again replaces it" \
+  "begin; $asst select public.save_patient_intake('$PT_MARIA', '{}',
+     '{\"under_treatment\":false,\"takes_medications\":false,\"medications\":\"ignored\",
+       \"signed_name\":\"Maria\",\"consent\":true}', 'staff');
+   reset role;
+   select (select count(*) from public.patient_intakes where patient_id='$PT_MARIA')
+          || '|' || coalesce(medications, 'none') || '|' || source
+   from public.patient_intakes where patient_id='$PT_MARIA'; rollback;" $'\n1|none|staff'
+expect_err_msg "another clinic's admin cannot fill in D-Touch's form" \
+  "$bright select public.save_patient_intake('$PT_MARIA', '{}', $INTAKE, 'staff');" \
+  "no such patient"
+expect_err "…nor write it straight into the table" \
+  "$bright insert into public.patient_intakes (patient_id, clinic_id, under_treatment,
+     takes_medications, consent_at, signed_name, source)
+   values ('$PT_JUAN', '$DENTAL', false, false, now(), 'J', 'staff');"
+expect_dml "…while at their own clinic they can" "$bright" \
+  "insert into public.patient_intakes (patient_id, clinic_id, under_treatment,
+     takes_medications, consent_at, signed_name, source)
+   values ('$PT_MARIA_BRIGHT', '$BRIGHT', false, false, now(), 'M', 'staff')
+   returning patient_id" 1
+expect_err "…and an intake cannot sit on another clinic's chart" \
+  "insert into public.patient_intakes (patient_id, clinic_id, under_treatment,
+     takes_medications, consent_at, signed_name, source)
+   values ('$PT_JUAN', '$BRIGHT', false, false, now(), 'J', 'staff');"
+expect_dml "nobody deletes a form" "$asst" \
+  "delete from public.patient_intakes where patient_id='$PT_MARIA' returning patient_id" 0
+
+GUARDIAN="'{\"under_treatment\":false,\"takes_medications\":false,
+  \"filled_by_guardian\":true,\"guardian_name\":\" Rosa Santos \",\"guardian_relationship\":\"parent\",
+  \"guardian_phone\":\"0917 555 0133\",\"guardian_email\":\" \",
+  \"signed_name\":\"Rosa Santos\",\"consent\":true}'::jsonb"
+expect_eq "a parent fills in the form for their child, and is recorded" \
+  "begin; $asst select count(*) from (select public.save_patient_intake('$PT_MARIA', '{}', $GUARDIAN, 'front_desk_tablet')) x;
+   reset role;
+   select guardian_name || '|' || guardian_relationship || '|' || guardian_phone || '|'
+          || coalesce(guardian_email, 'none') || '|' || signed_name
+     from public.patient_intakes where patient_id='$PT_MARIA'; rollback;" \
+  $'1\nRosa Santos|parent|0917 555 0133|none|Rosa Santos'
+expect_eq "…and the patient app can say so too" \
+  "begin; $juan select count(*) from (select public.save_patient_intake('$PT_JUAN', '{}', $GUARDIAN, 'patient_app')) x;
+   select guardian_relationship from public.patient_intakes where patient_id='$PT_JUAN'; rollback;" \
+  $'1\nparent'
+expect_err_msg "a guardian needs a name, relationship and phone" \
+  "$asst select public.save_patient_intake('$PT_MARIA', '{}',
+     '{\"under_treatment\":false,\"takes_medications\":false,\"filled_by_guardian\":true,
+       \"guardian_name\":\"Rosa\",\"guardian_relationship\":\"parent\",
+       \"signed_name\":\"Rosa\",\"consent\":true}', 'staff');" \
+  "name, relationship and phone"
+expect_err "…and is a parent or a guardian" \
+  "$asst select public.save_patient_intake('$PT_MARIA', '{}',
+     '{\"under_treatment\":false,\"takes_medications\":false,\"filled_by_guardian\":true,
+       \"guardian_name\":\"Rosa\",\"guardian_relationship\":\"neighbour\",\"guardian_phone\":\"0917\",
+       \"signed_name\":\"Rosa\",\"consent\":true}', 'staff');"
+expect_eq "without the box ticked, guardian keys are ignored" \
+  "begin; $asst select count(*) from (select public.save_patient_intake('$PT_MARIA', '{}',
+     '{\"under_treatment\":false,\"takes_medications\":false,\"guardian_name\":\"Stray\",
+       \"signed_name\":\"Maria\",\"consent\":true}', 'staff')) x;
+   reset role;
+   select coalesce(guardian_name, 'none') from public.patient_intakes where patient_id='$PT_MARIA'; rollback;" \
+  $'1\nnone'
+expect_eq "a later form by the patient themself clears the guardian" \
+  "begin; $asst select count(*) from (select public.save_patient_intake('$PT_MARIA', '{}', $GUARDIAN, 'staff')) x;
+   select count(*) from (select public.save_patient_intake('$PT_MARIA', '{}', $INTAKE, 'staff')) x;
+   reset role;
+   select coalesce(guardian_name, 'none') from public.patient_intakes where patient_id='$PT_MARIA'; rollback;" \
+  $'1\n1\nnone'
+expect_err "a half-guardian cannot be written straight into the table" \
+  "insert into public.patient_intakes (patient_id, clinic_id, under_treatment,
+     takes_medications, consent_at, signed_name, source, guardian_name)
+   values ('$PT_MARIA_BRIGHT', '$BRIGHT', false, false, now(), 'M', 'staff', 'Rosa')
+   on conflict (patient_id) do update set guardian_name = excluded.guardian_name;"
+
+print "\n── Staff PIN (front desk tablet) ──────────────────────────────"
+expect_eq "no PIN until one is set" "$asst select public.has_staff_pin();" "f"
+expect_err_msg "a PIN is four digits" "$asst select public.set_staff_pin('12a4');" "4 digits"
+expect_err_msg "patients have no staff PIN" "$juan select public.set_staff_pin('1234');" "only clinic staff"
+expect_err_msg "checking a PIN that was never set says so" \
+  "$asst select public.verify_staff_pin('1234');" "set a staff PIN first"
+expect_ok "the front desk sets a PIN" "$asst select public.set_staff_pin('2468');"
+expect_eq "…and has one now" "$asst select public.has_staff_pin();" "t"
+expect_eq "the right PIN unlocks" "$asst select public.verify_staff_pin('2468');" "t"
+expect_eq "a wrong one does not" "$asst select public.verify_staff_pin('0000');" "f"
+expect_eq "the PIN is one account's: the doctor has none" "$doc select public.has_staff_pin();" "f"
+expect_eq "nobody reads the stored PINs" "$asst select count(*) from public.staff_pins;" 0
+expect_err_msg "five wrong PINs lock it, even against the right one" \
+  "$asst select public.verify_staff_pin('0000') from generate_series(1, 5);
+   select public.verify_staff_pin('2468');" "too many wrong PINs"
+expect_eq "…the wrong attempts are counted even though each only returns false" \
+  "$asst select public.verify_staff_pin('1111'); reset role;
+   select failed_attempts from public.staff_pins where profile_id='$ASST_AUTH';" \
+  $'f\n2'
+expect_ok "setting a new PIN clears the count" "$asst select public.set_staff_pin('1357');"
+expect_err "anon cannot check PINs" "$anon select public.verify_staff_pin('1357');"
+
+print "\n── Patient import / export ────────────────────────────────────"
+# Two new patients (one with the form, a note and an old balance), one that
+# is Maria again under a different phone format, and one bad row.
+IMPORT_ROWS="'[
+  {\"row\":2,\"chart_number\":\"A-0001\",
+   \"person\":{\"full_name\":\" Rosa Imported \",\"phone\":\"0917 555 0301\",\"date_of_birth\":\"1970-01-02\",\"sex\":\"female\"},
+   \"intake\":{\"under_treatment\":false,\"takes_medications\":true,\"medications\":\"Metformin\",
+              \"allergies\":[\"latex\"],\"signed_name\":\"Rosa Imported\",\"signed_on\":\"2024-05-06\"},
+   \"chart_note\":\"Sensitive lower molars.\",\"opening_balance\":\"1500.50\"},
+  {\"row\":3,\"person\":{\"full_name\":\"Nophone Imported\"}},
+  {\"row\":4,\"person\":{\"full_name\":\"maria reyes\",\"phone\":\"+63 928 123 4567\"}},
+  {\"row\":5,\"person\":{\"full_name\":\"Bad Sex\",\"phone\":\"0917 555 0302\",\"sex\":\"x\"}}
+]'::jsonb"
+res() { print -r -- "(select string_agg(e->>'result', ',' order by (e->>'row')::int) from jsonb_array_elements($1) e)" }
+
+expect_eq "a dry run says what each row would do" \
+  "$asst select $(res "public.import_patients('$DENTAL', $IMPORT_ROWS)");" \
+  "created,created,duplicate,error"
+expect_eq "…and writes nothing" \
+  "$asst select count(*) from public.persons where full_name like '%Imported%';" 0
+expect_eq "…and takes no invoice number" \
+  "select count(*) from public.invoices where notes = 'Opening balance (imported)';" 0
+expect_eq "the duplicate names the patient already here" \
+  "$asst select e->'match'->>'id' from jsonb_array_elements(public.import_patients('$DENTAL', $IMPORT_ROWS)) e
+   where e->>'row' = '4';" "$PT_MARIA"
+expect_eq "a bad value is explained on its row" \
+  "$asst select e->>'message' from jsonb_array_elements(public.import_patients('$DENTAL', $IMPORT_ROWS)) e
+   where e->>'row' = '5';" "Sex must be Female or Male."
+expect_eq "a missing phone is a warning, not a failure" \
+  "$asst select jsonb_array_length(e->'warnings') from jsonb_array_elements(public.import_patients('$DENTAL', $IMPORT_ROWS)) e
+   where e->>'row' = '3';" 1
+expect_eq "the front desk's notes are left out, with a warning" \
+  "$asst select e->'warnings'->>0 from jsonb_array_elements(public.import_patients('$DENTAL', $IMPORT_ROWS)) e
+   where e->>'row' = '2';" "Clinic notes were left out: only doctors and admins can add them."
+expect_err_msg "doctors do not import" \
+  "$doc select public.import_patients('$DENTAL', $IMPORT_ROWS);" "Only the front desk and admins"
+expect_err_msg "nor does another clinic's admin" \
+  "$bright select public.import_patients('$DENTAL', $IMPORT_ROWS);" "Only the front desk and admins"
+expect_err "nor anon" "$anon select public.import_patients('$DENTAL', $IMPORT_ROWS);"
+expect_err_msg "a batch belongs to its clinic" \
+  "begin; $dtadmin select public.import_patients('$BRIGHT', '[]',
+     public.start_import('$DENTAL', 'patients', 'x.csv')); rollback;" "Only the front desk and admins"
+expect_err_msg "…and to whoever started it" \
+  "begin; $dtadmin select 1 where set_config('test.batch', public.start_import('$DENTAL', 'patients', 'x.csv')::text, true) is null;
+   $asst select public.import_patients('$DENTAL', '[]', current_setting('test.batch')::uuid); rollback;" "not yours"
+
+# The real run, kept (no rollback) for the checks that follow; undone below.
+psql $CONN -c "$dtadmin select public.start_import('$DENTAL', 'patients', 'legacy.csv');" > /dev/null
+BATCH=$(trim "$(psql $CONN -c "select id from public.import_batches where file_name='legacy.csv';")")
+IMPORT_OUT=$(trim "$(psql $CONN -c "$dtadmin select $(res "public.import_patients('$DENTAL', $IMPORT_ROWS, '$BATCH')");")")
+expect_eq "an admin imports: created, created, duplicate held back, error" \
+  "select '$IMPORT_OUT';" "created,created,duplicate,error"
+expect_eq "…the batch keeps the tally" \
+  "select created_count || '/' || updated_count || '/' || skipped_count || '/' || failed_count
+   from public.import_batches where id='$BATCH';" "2/0/1/1"
+expect_eq "…the person, trimmed, with a chart and its number" \
+  "select pe.full_name || '|' || pt.chart_number from public.patients pt
+   join public.persons pe on pe.id=pt.person_id where pt.clinic_id='$DENTAL' and pe.full_name='Rosa Imported';" \
+  "Rosa Imported|A-0001"
+expect_eq "…the form, marked as imported and dated as signed" \
+  "select i.source || '|' || i.medications || '|' || (i.consent_at at time zone 'Asia/Manila')::date
+   from public.patient_intakes i join public.patients pt on pt.id=i.patient_id
+   where pt.chart_number='A-0001';" "import|Metformin|2024-05-06"
+expect_eq "…the clinic note (an admin is a clinician)" \
+  "select n.body from public.chart_notes n join public.patients pt on pt.id=n.patient_id
+   where pt.chart_number='A-0001';" "Sensitive lower molars."
+expect_eq "…and what they owed, as an issued bill" \
+  "select v.status || '|' || v.balance from public.invoices v join public.patients pt on pt.id=v.patient_id
+   where pt.chart_number='A-0001';" "issued|1500.50"
+expect_eq "the same file again finds them by chart number and changes nothing twice" \
+  "begin; $dtadmin select $(res "public.import_patients('$DENTAL', $IMPORT_ROWS, '$BATCH')");
+   reset role;
+   select count(*) from public.invoices v join public.patients pt on pt.id=v.patient_id
+    where pt.chart_number='A-0001';
+   select n.body from public.chart_notes n join public.patients pt on pt.id=n.patient_id
+    where pt.chart_number='A-0001';
+   rollback;" \
+  $'updated,duplicate,duplicate,error\n1\nSensitive lower molars.'
+expect_eq "an update fills in, and a blank cell blanks nothing" \
+  "begin; $asst select $(res "public.import_patients('$DENTAL',
+     '[{\"row\":2,\"chart_number\":\"a-0001\",\"person\":{\"address\":\"Pasig\"},
+        \"intake\":{\"medications\":\"Metformin 500mg\"}}]', public.start_import('$DENTAL', 'patients', 't.csv'))");
+   reset role;
+   select pe.phone || '|' || pe.address || '|' || i.medications || '|' || array_to_string(i.allergies, ',')
+     from public.patients pt join public.persons pe on pe.id=pt.person_id
+     join public.patient_intakes i on i.patient_id=pt.id where pt.chart_number='A-0001';
+   rollback;" $'updated\n0917 555 0301|Pasig|Metformin 500mg|latex'
+expect_eq "a duplicate, once decided, updates the patient already here" \
+  "begin; $asst select $(res "public.import_patients('$DENTAL',
+     '[{\"row\":4,\"action\":\"update\",\"match_id\":\"$PT_MARIA\",\"chart_number\":\"M-7\",
+        \"person\":{\"full_name\":\"maria reyes\"}}]', public.start_import('$DENTAL', 'patients', 't.csv'))");
+   reset role; select chart_number from public.patients where id='$PT_MARIA'; rollback;" $'updated\nM-7'
+expect_eq "…or is added as someone new" \
+  "begin; $asst select $(res "public.import_patients('$DENTAL',
+     '[{\"row\":4,\"action\":\"create\",\"person\":{\"full_name\":\"Maria Reyes\",\"phone\":\"09281234567\"}}]', public.start_import('$DENTAL', 'patients', 't.csv'))");
+   rollback;" "created"
+expect_eq "…and cannot update a chart at another clinic" \
+  "$asst select e->>'message' from jsonb_array_elements(public.import_patients('$DENTAL',
+     '[{\"row\":9,\"action\":\"update\",\"match_id\":\"$PT_MARIA_BRIGHT\",\"person\":{}}]')) e;" \
+  "The patient to update is not at this clinic."
+expect_eq "an exported id from another clinic is refused" \
+  "$asst select e->>'result' from jsonb_array_elements(public.import_patients('$DENTAL',
+     '[{\"row\":9,\"patient_id\":\"$PT_MARIA_BRIGHT\",\"person\":{\"full_name\":\"X\"}}]')) e;" "error"
+expect_eq "a chart number is one patient's" \
+  "$asst select e->>'message' from jsonb_array_elements(public.import_patients('$DENTAL',
+     '[{\"row\":9,\"action\":\"create\",\"chart_number\":\"A-0001\",\"person\":{\"full_name\":\"Someone Else\"}}]')) e;" \
+  "That chart number is already used by another patient here."
+expect_eq "a form needs who signed it" \
+  "$asst select e->>'message' from jsonb_array_elements(public.import_patients('$DENTAL',
+     '[{\"row\":9,\"person\":{\"full_name\":\"Unsigned Form\"},\"intake\":{\"under_treatment\":false,\"takes_medications\":false}}]')) e;" \
+  'The form has no "Signed by": give the name it was signed with.'
+expect_err "nobody writes batches by hand" \
+  "$dtadmin insert into public.import_records values ('$BATCH', 'patients', '$PT_MARIA', 'created');"
+expect_eq "the front desk sees the clinic's imports" \
+  "$asst select count(*) from public.import_batches where clinic_id='$DENTAL';" 1
+expect_eq "…another clinic does not" "$bright select count(*) from public.import_batches;" 0
+
+expect_eq "an export has every chart here, and only here" \
+  "$asst select jsonb_array_length(public.export_patients('$DENTAL', 1000, 0));" \
+  "$(trim "$(psql $CONN -c "select count(*) from public.patients where clinic_id='$DENTAL';")")"
+expect_eq "…with the form and the chart number" \
+  "$asst select e->>'chart_number' || '|' || (e->'intake'->>'medications') || '|' || (e->'intake'->>'signed_on')
+   from jsonb_array_elements(public.export_patients('$DENTAL')) e where e->>'full_name'='Rosa Imported';" \
+  "A-0001|Metformin|2024-05-06"
+expect_eq "…the clinic note for an admin" \
+  "$dtadmin select e->>'chart_note' from jsonb_array_elements(public.export_patients('$DENTAL')) e
+   where e->>'full_name'='Rosa Imported';" "Sensitive lower molars."
+expect_eq "…but never for the front desk" \
+  "$asst select count(*) from jsonb_array_elements(public.export_patients('$DENTAL')) e
+   where e->>'chart_note' is not null;" 0
+expect_eq "…and what they owe" \
+  "$asst select e->>'balance' from jsonb_array_elements(public.export_patients('$DENTAL')) e
+   where e->>'full_name'='Rosa Imported';" "1500.50"
+expect_eq "pages are by name and add up" \
+  "$asst select sum(jsonb_array_length(public.export_patients('$DENTAL', 2, o)))
+   from generate_series(0, 20, 2) o;" \
+  "$(trim "$(psql $CONN -c "select count(*) from public.patients where clinic_id='$DENTAL';")")"
+expect_err_msg "doctors do not export" "$doc select public.export_patients('$DENTAL');" "Only the front desk and admins"
+expect_eq "every export is on record, once per file" \
+  "select count(*) from public.data_exports where clinic_id='$DENTAL' and created_by='$DT_ADMIN_AUTH';" 1
+expect_eq "…which admins can read" "$dtadmin select count(*) from public.data_exports;" \
+  "$(trim "$(psql $CONN -c "select count(*) from public.data_exports where clinic_id='$DENTAL';")")"
+expect_eq "…and the front desk cannot" "$asst select count(*) from public.data_exports;" 0
+
+expect_err_msg "an import with a visit since cannot be undone" \
+  "begin; insert into public.appointments (clinic_id, patient_id, doctor_id, service_name, scheduled_at)
+   select '$DENTAL', pt.id, '$DR_SANTOS', 'Checkup', now() + interval '30 days'
+     from public.patients pt where pt.chart_number='A-0001';
+   $dtadmin select public.undo_import('$BATCH'); rollback;" "1 of the patients this import added"
+expect_err_msg "the front desk cannot undo an admin's import" \
+  "$asst select public.undo_import('$BATCH');" "Only an admin or whoever ran"
+expect_eq "undo removes what it added: patients, people, the opening bill" \
+  "$dtadmin select public.undo_import('$BATCH')->>'removed'; reset role;
+   select count(*) from public.persons where full_name like '%Imported%';
+   select count(*) from public.invoices where notes = 'Opening balance (imported)';" $'2\n0\n0'
+expect_err_msg "…once" "$dtadmin select public.undo_import('$BATCH');" "already undone"
+expect_err_msg "an undone batch takes no more rows" \
+  "$dtadmin select public.import_patients('$DENTAL', '[]', '$BATCH');" "not yours"
+psql $CONN -c "delete from public.import_batches where id='$BATCH'; delete from public.data_exports;" > /dev/null
+
+print "\n── Visit and dental chart import / export ─────────────────────"
+VISIT_ROWS="'[
+  {\"row\":2,\"patient_id\":\"$PT_JUAN\",\"doctor_id\":\"$DR_SANTOS\",\"date\":\"2023-01-10\",\"service\":\"teeth cleaning\"},
+  {\"row\":3,\"patient_name\":\"maria reyes\",\"patient_phone\":\"0928 123 4567\",\"doctor_id\":\"$DR_SANTOS\",
+   \"date\":\"2023-01-10\",\"service\":\"Old Denture Fitting\",\"duration_minutes\":\"60\",
+   \"visit_note\":\"Upper denture relined.\",\"patient_note\":\"Soft food today.\"},
+  {\"row\":4,\"patient_id\":\"$PT_JUAN\",\"doctor_id\":\"$DR_SANTOS\",\"date\":\"2023-01-10\",\"service\":\"Teeth Cleaning\"},
+  {\"row\":5,\"patient_id\":\"$PT_JUAN\",\"doctor_id\":\"$DR_SANTOS\",\"date\":\"2031-01-06\"},
+  {\"row\":6,\"patient_id\":\"$PT_JUAN\",\"doctor_id\":\"$DR_SANTOS\",\"date\":\"2023-02-01\",\"status\":\"confirmed\"},
+  {\"row\":7,\"patient_name\":\"Nobody Here\",\"doctor_id\":\"$DR_SANTOS\",\"date\":\"2023-02-01\"},
+  {\"row\":8,\"patient_id\":\"$PT_JUAN\",\"doctor_id\":\"$WALKIN\",\"date\":\"2023-02-01\"},
+  {\"row\":9,\"patient_id\":\"$PT_JUAN\",\"doctor_id\":\"$DR_SANTOS\",\"date\":\"2031-01-06\",\"time\":\"10:00\",\"service\":\"Dental X-Ray\"},
+  {\"row\":10,\"patient_id\":\"$PT_MARIA\",\"doctor_id\":\"$DR_SANTOS\",\"date\":\"2031-01-06\",\"time\":\"10:00\",\"service\":\"Dental X-Ray\"},
+  {\"row\":11,\"patient_id\":\"$PT_MARIA\",\"doctor_id\":\"$DR_SANTOS\",\"date\":\"2023-03-01\",\"status\":\"no_show\"}
+]'::jsonb"
+msg() { print -r -- "(select e->>'message' from jsonb_array_elements($1) e where e->>'row' = '$2')" }
+
+expect_eq "a visits dry run says what each row would do" \
+  "$asst select $(res "public.import_visits('$DENTAL', $VISIT_ROWS)");" \
+  "created,created,skipped,error,error,error,error,created,error,created"
+expect_eq "…and writes nothing" \
+  "select count(*) from public.appointments where imported or service_name = 'Old Denture Fitting';" 0
+expect_eq "an upcoming visit needs a time" \
+  "$asst select $(msg "public.import_visits('$DENTAL', $VISIT_ROWS)" 5);" "An upcoming visit needs a time."
+expect_eq "a past visit is over" \
+  "$asst select $(msg "public.import_visits('$DENTAL', $VISIT_ROWS)" 6);" \
+  "A past visit is Completed, Cancelled or No-show, not confirmed."
+expect_eq "a patient who is not here is named" \
+  "$asst select $(msg "public.import_visits('$DENTAL', $VISIT_ROWS)" 7);" \
+  "No patient here matches Nobody Here. Import the patients first."
+expect_eq "a doctor must be on this clinic's roster" \
+  "$asst select $(msg "public.import_visits('$DENTAL', $VISIT_ROWS)" 8);" \
+  "Match this row's doctor to one on the roster."
+expect_eq "upcoming visits are bookings: the doctor cannot be in two places" \
+  "$asst select $(msg "public.import_visits('$DENTAL', $VISIT_ROWS)" 10);" \
+  "This doctor already has a visit at that time. Pick another time."
+expect_eq "the front desk's visit notes are left out, with a warning" \
+  "$asst select e->'warnings'->>0 from jsonb_array_elements(public.import_visits('$DENTAL', $VISIT_ROWS)) e
+   where e->>'row' = '3';" "Visit notes were left out: only doctors and admins can add them."
+expect_err_msg "doctors do not import visits" \
+  "$doc select public.import_visits('$DENTAL', $VISIT_ROWS);" "Only the front desk and admins"
+expect_err_msg "a patients batch takes no visits" \
+  "begin; $dtadmin select public.import_visits('$DENTAL', '[]',
+     public.start_import('$DENTAL', 'patients', 'x.csv')); rollback;" "not yours"
+
+psql $CONN -c "$dtadmin select public.start_import('$DENTAL', 'visits', 'visits.csv');" > /dev/null
+VBATCH=$(trim "$(psql $CONN -c "select id from public.import_batches where file_name='visits.csv';")")
+VOUT=$(trim "$(psql $CONN -c "$dtadmin select $(res "public.import_visits('$DENTAL', $VISIT_ROWS, '$VBATCH')");")")
+expect_eq "an admin imports the visits" "select '$VOUT';" \
+  "created,created,skipped,error,error,error,error,created,error,created"
+expect_eq "past visits are history: completed at 09:00 Manila, the same doctor twice at once" \
+  "select count(*) || '|' || bool_and(imported) || '|' || min(to_char(scheduled_at at time zone 'Asia/Manila', 'HH24:MI'))
+          || '|' || bool_and(completed_at = ends_at)
+   from public.appointments where (scheduled_at at time zone 'Asia/Manila')::date = '2023-01-10';" \
+  "2|true|09:00|true"
+expect_eq "…with the service matched, or kept as typed with its length" \
+  "select string_agg(service_name || ':' || (service_id is not null) || ':' || duration_minutes, ',' order by service_name)
+   from public.appointments where (scheduled_at at time zone 'Asia/Manila')::date = '2023-01-10';" \
+  "Old Denture Fitting:false:60,Teeth Cleaning:true:45"
+expect_eq "…and an admin's notes" \
+  "select n.body || '|' || a.patient_note from public.appointments a join public.visit_notes n on n.appointment_id = a.id
+   where a.service_name = 'Old Denture Fitting';" "Upper denture relined.|Soft food today."
+expect_eq "a past no-show is history too" \
+  "select status || '|' || imported from public.appointments where patient_id='$PT_MARIA'
+   and (scheduled_at at time zone 'Asia/Manila')::date = '2023-03-01';" "no_show|true"
+expect_eq "an upcoming visit is an ordinary booking" \
+  "select status || '|' || imported from public.appointments where patient_id='$PT_JUAN'
+   and (scheduled_at at time zone 'Asia/Manila')::date = '2031-01-06';" "confirmed|false"
+expect_eq "the same file again adds nothing" \
+  "begin; $dtadmin select $(res "public.import_visits('$DENTAL', $VISIT_ROWS, '$VBATCH')"); rollback;" \
+  "skipped,skipped,skipped,error,error,error,error,skipped,error,skipped"
+expect_err_msg "only an import marks history" \
+  "$asst insert into public.appointments (clinic_id, patient_id, doctor_id, service_name, scheduled_at, imported)
+   values ('$DENTAL', '$PT_JUAN', '$DR_SANTOS', 'X', now() - interval '400 days', true);" "Only an import"
+expect_err_msg "…and it cannot be switched on later" \
+  "$dtadmin update public.appointments set imported = true where id = '$A2';" "Only an import"
+
+expect_eq "a visits export has every visit here" \
+  "$asst select jsonb_array_length(public.export_visits('$DENTAL', 1000, 0));" \
+  "$(trim "$(psql $CONN -c "select count(*) from public.appointments where clinic_id='$DENTAL';")")"
+expect_eq "…with doctor, time and the admin's notes" \
+  "$dtadmin select e->>'doctor' || '|' || (e->>'time') || '|' || (e->>'visit_note')
+   from jsonb_array_elements(public.export_visits('$DENTAL', 1000, 0)) e where e->>'service' = 'Old Denture Fitting';" \
+  "Maria Santos|09:00|Upper denture relined."
+expect_eq "…and no visit notes for the front desk" \
+  "$asst select count(*) from jsonb_array_elements(public.export_visits('$DENTAL', 1000, 0)) e
+   where e->>'visit_note' is not null;" 0
+
+DENTAL_ROWS="'[
+  {\"row\":2,\"patient_id\":\"$PT_JUAN\",\"tooth\":16,\"surfaces\":[\"O\",\"M\"],\"code\":\"filling\",\"status\":\"done\",\"date\":\"2023-01-10\",\"note\":\" Composite \"},
+  {\"row\":3,\"patient_id\":\"$PT_JUAN\",\"tooth\":36,\"code\":\"extraction\",\"status\":\"done\"},
+  {\"row\":4,\"patient_id\":\"$PT_JUAN\",\"tooth\":19,\"code\":\"filling\"},
+  {\"row\":5,\"patient_id\":\"$PT_JUAN\",\"tooth\":26,\"surfaces\":[\"D\"],\"code\":\"caries\",\"status\":\"planned\"},
+  {\"row\":6,\"patient_id\":\"$PT_JUAN\",\"tooth\":16,\"surfaces\":[\"M\",\"O\"],\"code\":\"filling\",\"date\":\"2023-01-10\"},
+  {\"row\":7,\"patient_id\":\"$PT_JUAN\",\"tooth\":46,\"code\":\"crown\",\"surfaces\":[\"O\"]}
+]'::jsonb"
+expect_err_msg "the front desk does not import dental charts" \
+  "$asst select public.import_dental('$DENTAL', $DENTAL_ROWS);" "Only doctors and admins"
+expect_err_msg "…nor start one" \
+  "$asst select public.start_import('$DENTAL', 'dental', 'x.csv');" "Only doctors and admins"
+expect_eq "a dental dry run: done at the visit that day, a repeat skipped, a bad tooth refused" \
+  "$dtadmin select $(res "public.import_dental('$DENTAL', $DENTAL_ROWS)");" \
+  "created,created,error,created,skipped,created"
+expect_eq "work with no visit to point at is recorded as already there" \
+  "$dtadmin select e->'warnings'->>0 from jsonb_array_elements(public.import_dental('$DENTAL', $DENTAL_ROWS)) e
+   where e->>'row' = '3';" "No date, so no visit to record it at: recorded as work already there."
+
+psql $CONN -c "$dtadmin select public.start_import('$DENTAL', 'dental', 'chart.csv');" > /dev/null
+DBATCH=$(trim "$(psql $CONN -c "select id from public.import_batches where file_name='chart.csv';")")
+psql $CONN -c "$dtadmin select public.import_dental('$DENTAL', $DENTAL_ROWS, '$DBATCH');" > /dev/null
+expect_eq "the filling is done at the imported visit, dated that day" \
+  "select e.status || '|' || array_to_string(e.surfaces, '') || '|' || e.note || '|' || a.service_name
+          || '|' || (e.created_at at time zone 'Asia/Manila')::date
+   from public.dental_chart_entries e join public.appointments a on a.id = e.appointment_id
+   where e.patient_id='$PT_JUAN' and e.tooth=16 and e.code='filling';" \
+  "done|MO|Composite|Teeth Cleaning|2023-01-10"
+expect_eq "an extraction with no visit is a missing tooth; a planned decay is a finding; a crown has no surfaces" \
+  "select string_agg(tooth || ':' || code || ':' || status || ':' || array_to_string(surfaces, ''), ',' order by tooth)
+   from public.dental_chart_entries where patient_id='$PT_JUAN' and tooth in (26, 36, 46)
+     and created_by = '$DT_ADMIN_AUTH';" \
+  "26:caries:existing:D,36:missing:existing:,46:crown:existing:"
+expect_eq "the front desk exports the chart" \
+  "$asst select count(*) from jsonb_array_elements(public.export_dental('$DENTAL', 1000, 0)) e
+   where e->>'patient_id' = '$PT_JUAN' and e->>'tooth' = '16' and e->>'surfaces' = 'MO' and e->>'date' = '2023-01-10';" 1
+
+expect_err_msg "a visit charted since cannot be undone" \
+  "$dtadmin select public.undo_import('$VBATCH');" "changed, billed or charted since"
+expect_err_msg "a chart entry changed since cannot be undone" \
+  "begin; update public.dental_chart_entries set note = 'edited' where note = 'Composite';
+   $dtadmin select public.undo_import('$DBATCH'); rollback;" "changed since"
+expect_eq "undo takes the chart entries back" \
+  "$dtadmin select public.undo_import('$DBATCH')->>'removed';" 4
+expect_eq "…and then the visits, notes and all" \
+  "$dtadmin select public.undo_import('$VBATCH')->>'removed'; reset role;
+   select count(*) from public.appointments where imported or service_name = 'Old Denture Fitting';
+   select count(*) from public.visit_notes where body = 'Upper denture relined.';" $'4\n0\n0'
+
+expect_eq "the patient list finds a chart by its number" \
+  "begin; update public.patients set chart_number = 'DT-0042' where id = '$PT_MARIA';
+   $asst select jsonb_array_length(r->'patients') || '|' || (r->'patients'->0->>'chart_number')
+   from public.search_patients('$DENTAL', 'dt-0042') r; rollback;" "1|DT-0042"
+psql $CONN -c "delete from public.import_batches where id in ('$VBATCH', '$DBATCH'); delete from public.data_exports;" > /dev/null
 
 print "\n── RLS coverage ───────────────────────────────────────────────"
 expect_eq "no public table left without RLS" \

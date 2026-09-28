@@ -55,8 +55,13 @@ supabase/
     20260924120000_rescheduling.sql           reschedule_appointment
     20260924120100_billing.sql                invoices, lines, payments
     20260924120200_notifications.sql          inbox, push subscriptions, reminders
+    20260925120000_dental_charting.sql        the odontogram, per tooth and surface
+    20260925120100_patient_search.sql         search_patients: paged directory
+    20260926120000_calendar_feed.sql          private iCalendar feed tokens
+    20260927120000_patient_intake.sql         information form, register_patient, staff PIN
   functions/
     send-push/index.ts                        Web Push delivery (Edge Function)
+    calendar-feed/                            a patient's visits as iCalendar (Edge Function)
     .env.example                              the secrets it needs
   seed.sql                                    four demo tenants, re-runnable
   dev/
@@ -64,7 +69,7 @@ supabase/
     provision_clinic.sql                      onboard a real clinic
   tests/
     run.sh                                    throwaway cluster → migrate → seed → test
-    rls_test.sh                               395 behavioural checks
+    rls_test.sh                               659 behavioural checks
     supabase_shim.sql                         test-only stubs for Supabase's auth schema
 docs/
   onboarding.md                               runbook for adding a clinic client
@@ -95,6 +100,7 @@ fixes, and each leaves the database in a working state on its own.
 | `payments` | Money received on an issued bill. Never edited or deleted; an admin voids a mistake, with a reason. |
 | `notifications` | Each account's inbox, one row per update, for one app. Written only by triggers. |
 | `push_subscriptions` | Browsers that asked for Web Push: one row per browser, owned by whoever signed in last on it. |
+| `dental_chart_entries` | The odontogram as a log, for verticals whose `clinic_types.chart_kind` is `dental`: per tooth (FDI) and surface, a condition found, work already present, planned, or done at a visit. The current chart is derived by the apps. Staff read; doctors and admins write; a patient reads their own through `patient_dental_chart()`, which leaves out the notes. |
 
 Integrity is declarative wherever possible:
 
@@ -201,6 +207,68 @@ Firebase project, no app-store builds. On iPhone, Web Push reaches a site only
 once it is added to the home screen (iOS 16.4+); the inbox reaches everyone.
 Signing out removes that browser's subscription first, so a shared device does
 not keep receiving the last person's notifications.
+
+### Calendar
+
+Patients can put their visits in Google Calendar, Apple Calendar or Outlook,
+with no Google Cloud project and no sign-in to Google:
+
+- **One visit** — the patient app's *Add to calendar* builds a Google Calendar
+  link or an `.ics` file on the device. Nothing server-side; it does not follow
+  a later move or cancellation.
+- **All visits, kept current** — each account can have a private feed URL,
+  `…/functions/v1/calendar-feed?token=…`, that calendar apps subscribe to. It
+  lists every visit at every clinic the person belongs to, from 90 days back,
+  minus cancellations and no-shows, so a moved or cancelled visit updates on
+  the next refresh. Google refreshes subscribed calendars only every few
+  hours; Apple and Outlook honour the hourly hint.
+
+A calendar app cannot sign in, so the token is the credential. The feed is
+kept thin for that reason, and because calendars get shared: clinic, doctor,
+time and address, never the service booked, notes or bills. The patient can
+reset the URL from the app, which kills every copy of the old one.
+`calendar_feed_events()` is callable only by the service role.
+
+### Importing and exporting patients, visits and dental charts
+
+The front desk and admins can move patients in and out as CSV
+(`20261003120000_patient_import_export`). The columns are the patient
+information form, the clinic's chart note and an optional old balance, so an
+exported file can be edited in Excel and imported back.
+
+- **Import** — `import_patients(clinic, rows, batch)`. Without a batch it is a
+  dry run: every row is written, checked and rolled back, so the app can show
+  what will happen first. With one (from `start_import`) it keeps each row that
+  succeeds. A row is matched to a chart by its exported id, then by the
+  clinic's `patients.chart_number`. A row that only *looks* like a patient
+  already here (same phone plus name or birthday, or the same name with nothing
+  contradicting it) is not written: it comes back as `duplicate` for a person
+  to update, add as new, or skip. An update never blanks anything. Clinical
+  notes go in only for doctors and admins. An old balance becomes one issued
+  bill, once per patient.
+- **Undo** — `undo_import(batch)` removes the patients a batch added, with
+  their forms, notes and opening bills. It works only while none of them has
+  had a visit, bill, payment or app account since, and it leaves changes to
+  existing patients as they are. An admin, or whoever ran the import, may undo
+  it.
+- **Export** — `export_patients` / `export_visits` / `export_dental(clinic,
+  limit, offset)` are SECURITY INVOKER, so notes come back only for
+  clinicians. Each export is logged in `data_exports`, which only admins can
+  read.
+- **Visits** (`20261004120000_history_import_export`) — `import_visits` finds
+  each row's patient by chart id, chart number, or name plus phone or birthday
+  (they must already be here), and takes the doctor as a roster id: the app
+  matches the file's names to the roster first, and an admin can add a doctor
+  who has left as an inactive one. Past visits go in as history:
+  `appointments.imported`, already completed, cancelled or no-show, and outside
+  both double-booking constraints, since paper records put two patients at
+  "9:00". Only `import_visits` can set that flag. Upcoming visits are ordinary
+  bookings, held to every rule. A visit already on file (same patient, day and
+  service) is skipped.
+- **Dental charts** — `import_dental`, doctors and admins only. Work marked
+  done is tied to the attended visit on its date. With no such visit it is
+  recorded as existing work (an extraction becomes a missing tooth), with a
+  warning. Undo takes back entries or visits only while they are unchanged.
 
 ## Tenancy
 
@@ -399,6 +467,18 @@ once per project:
 To see a delivery fail, look at `net._http_response` (the database's side) and
 the function's logs in the dashboard.
 
+### 7. Calendar feed
+
+```sh
+supabase functions deploy calendar-feed --use-api
+# Optional: link each event to the visit in the patient app.
+supabase secrets set PATIENT_APP_URL=https://<patient app address>
+```
+
+`config.toml` turns off its JWT check: calendar apps cannot send one. Check it
+with a token from `select public.my_calendar_feed_token();` run as a patient:
+`curl '…/functions/v1/calendar-feed?token=<token>'` returns `BEGIN:VCALENDAR…`.
+
 ### Upgrading a project that predates the tenancy migrations
 
 The `20260914…` migrations carry existing data over: each patient becomes a
@@ -422,7 +502,7 @@ deployed. Ship both together.
 ```
 
 Spins up a throwaway Postgres cluster, applies every migration, seeds twice (to
-prove the seed is idempotent), and runs 395 checks: seed integrity, the
+prove the seed is idempotent), and runs 659 checks: seed integrity, the
 declarative constraints, the auth bridge, RLS from the perspective of a patient,
 doctor, assistant, admin and anonymous caller, isolation between two dental
 tenants, the onboarding functions, branch admins, the staff-code flow, the

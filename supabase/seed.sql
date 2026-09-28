@@ -312,3 +312,38 @@ insert into public.visit_notes (appointment_id, clinic_id, body) values
   ('40000000-0000-0000-0000-000000000012', '10000000-0000-0000-0000-000000000003', 'MMR vaccine administered. Next dose in 12 months.')
 on conflict (appointment_id) do update set
   body = excluded.body;
+
+-- The dental charts. Juan's cleaning (40…06) found decay on 46, and the root
+-- canal booked for him (40…04) is the plan it produced; Maria's X-ray found
+-- nothing new. Rows with no visit were on file before these visits.
+insert into public.dental_chart_entries
+  (id, clinic_id, patient_id, appointment_id, tooth, surfaces, code, status, note)
+values
+  ('60000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001',
+   '30000000-0000-0000-0000-000000000001', null, 16, '{O}', 'filling', 'existing', 'Amalgam'),
+  ('60000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001',
+   '30000000-0000-0000-0000-000000000001', null, 38, '{}', 'missing', 'existing', null),
+  ('60000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001',
+   '30000000-0000-0000-0000-000000000001', '40000000-0000-0000-0000-000000000006',
+   46, '{O,D}', 'caries', 'existing', 'Deep, close to the pulp'),
+  ('60000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001',
+   '30000000-0000-0000-0000-000000000001', '40000000-0000-0000-0000-000000000006',
+   46, '{}', 'root_canal', 'planned', null),
+  ('60000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000001',
+   '30000000-0000-0000-0000-000000000001', '40000000-0000-0000-0000-000000000006',
+   36, '{O}', 'sealant', 'done', null),
+  ('60000000-0000-0000-0000-000000000006', '10000000-0000-0000-0000-000000000001',
+   '30000000-0000-0000-0000-000000000002', null, 11, '{}', 'crown', 'existing', 'Porcelain'),
+  ('60000000-0000-0000-0000-000000000007', '10000000-0000-0000-0000-000000000001',
+   '30000000-0000-0000-0000-000000000002', '40000000-0000-0000-0000-000000000007',
+   24, '{}', 'watch', 'existing', 'Shadow on the X-ray; recheck in 6 months'),
+  -- Maria at BrightSmile: a separate chart at a separate tenant.
+  ('60000000-0000-0000-0000-000000000008', '10000000-0000-0000-0000-000000000004',
+   '30000000-0000-0000-0000-00000000000d', null, 21, '{}', 'veneer', 'existing', null)
+on conflict (id) do update set
+  appointment_id = excluded.appointment_id,
+  tooth          = excluded.tooth,
+  surfaces       = excluded.surfaces,
+  code           = excluded.code,
+  status         = excluded.status,
+  note           = excluded.note;

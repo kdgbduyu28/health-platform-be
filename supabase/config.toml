@@ -417,3 +417,8 @@ enabled = true
 # by a signed-in user, so there is no JWT to verify.
 [functions.send-push]
 verify_jwt = false
+
+# Read by calendar apps, which cannot sign in; the token in the URL is the
+# credential.
+[functions.calendar-feed]
+verify_jwt = false
