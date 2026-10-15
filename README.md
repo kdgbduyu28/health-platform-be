@@ -270,6 +270,25 @@ exported file can be edited in Excel and imported back.
   recorded as existing work (an extraction becomes a missing tooth), with a
   warning. Undo takes back entries or visits only while they are unchanged.
 
+### Privacy Policy and Terms (RA 10173)
+
+The Data Privacy Act gives people the right to be told how their data is
+used before it is collected. The apps carry the platform's Privacy Policy and
+Terms and Conditions (`PrivacyPolicy` / `TermsAndConditions` in the FE, at
+`/privacy` and `/terms` and in Settings). The create-account form will not
+submit until the unticked "I agree to the Terms and Conditions and have read
+the Privacy Policy" box is ticked. `20261006120000_policy_acknowledgements`
+records this: `policy_acknowledgements` gets one row per document
+(`privacy`, `terms`) with its version (its date) and the time.
+`handle_new_user` writes them from the sign-up metadata
+`privacy_policy_version` / `terms_version`, and
+`acknowledge_policy(document, version)` covers accounts made earlier. A missing
+version never blocks a sign-up. Each person reads only their own rows, and
+nobody edits them.
+
+This is not consent to health processing. That is asked for separately, per
+clinic, on the patient information form (`patient_intakes.consent_at`).
+
 ## Tenancy
 
 **Belonging.** Staff belong to a clinic through a membership, which carries
@@ -430,6 +449,63 @@ works for real users:
 
 Then check *Authentication → Rate Limits*: the email limit caps password resets
 per hour across the whole project.
+
+#### Bot protection (CAPTCHA)
+
+Sign-in, sign-up and sending a reset code carry a Cloudflare Turnstile token
+(free, no request limit). Supabase Auth checks it with Cloudflare and refuses
+the request without one, so a script cannot guess passwords or create
+accounts in bulk however it calls the API. Sign-up and reset show the check;
+sign-in runs it unseen and brings it into view after three wrong passwords.
+Cloudflare decides when a person has to click.
+
+Order matters: an app build without the site key cannot sign anyone in once
+CAPTCHA is on.
+
+1. **Create the widget** — Cloudflare dashboard → *Turnstile → Add widget*.
+   Mode *Managed*; hostnames: the four `rowph*.pages.dev` hosts (and any
+   custom domain). It gives a site key and a secret key.
+2. **Ship the apps with the site key** — set it as the default of
+   `SupabaseConfig.turnstileSiteKey` in health-platform-fe (or pass
+   `--dart-define=TURNSTILE_SITE_KEY=…`) and deploy all four apps. While
+   CAPTCHA is still off, Supabase ignores the tokens.
+3. **Turn it on** — *Authentication → Attack Protection → Enable CAPTCHA
+   protection*, provider *Turnstile*, paste the secret key.
+
+To switch it off again, untick it in step 3; the apps keep working.
+
+Locally, `[auth.captcha]` in `supabase/config.toml` is off. To try it, use
+Cloudflare's test keys: site key `1x00000000000000000000AA` in the app and
+secret `1x0000000000000000000000000000000AA` in
+`SUPABASE_AUTH_CAPTCHA_SECRET`; both always pass.
+
+#### Sign in with Google
+
+The sign-in screen shows *Continue with Google* only once Supabase reports
+Google as enabled (`/auth/v1/settings`), so builds can ship before this is
+done. A Google account's name becomes its profile name (handle_new_user reads
+`full_name`). Signing in with Google for the first time creates an account, so
+the apps ask a Google account to agree to the Privacy Policy and Terms once
+(`acknowledge_policy`), unless the box was ticked on the create-account form
+before it went to Google. An existing email account with the same, confirmed
+address is linked rather than duplicated.
+
+1. **Google Cloud** — *APIs & Services → OAuth consent screen*: external,
+   app name, support email, the Privacy Policy and Terms URLs. Then
+   *Credentials → Create credentials → OAuth client ID*, type *Web
+   application*:
+   - Authorised JavaScript origins: the four app origins
+     (`https://rowphpatient.pages.dev`, `…doctor…`, `…assistant…`, `…admin…`).
+   - Authorised redirect URI: `https://<project-ref>.supabase.co/auth/v1/callback`
+     (Supabase shows it under *Authentication → Sign In / Providers → Google*).
+2. **Supabase** — *Authentication → Sign In / Providers → Google*: enable,
+   paste the client ID and secret.
+3. **Redirect URLs** — *Authentication → URL Configuration → Redirect URLs*:
+   add `https://rowph*.pages.dev/**` (Google returns to the page it left
+   from, clinic links included). Add `http://localhost:*/**` for local dev.
+
+Locally, `[auth.external.google]` in `supabase/config.toml` reads
+`SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID` and `…_SECRET`.
 
 ### 6. Push notifications
 

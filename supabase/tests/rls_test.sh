@@ -341,9 +341,12 @@ expect_dml "cannot delete an appointment (admin only)" "$doc" \
 # A denied INSERT raises (WITH CHECK) rather than matching zero rows.
 expect_err "cannot add a service (admin only)" \
   "$doc insert into public.services (clinic_id,name) values ('$DENTAL','Sneaky');"
-expect_err "cannot register a walk-in (assistants and admins only)" \
-  "$doc select public.book_walk_in('$DENTAL','Doc Walk-in','09171119999',
-     '$DR_SANTOS','Teeth Cleaning', now() + interval '95 days');"
+expect_ok "CAN book a walk-in for a new patient (every staff role adds patients)" \
+  "begin; $doc select public.book_walk_in('$DENTAL','Doc Walk-in','09171119999',
+     '$DR_SANTOS','Teeth Cleaning', now() + interval '95 days'); rollback;"
+expect_err "…but not at a clinic they do not work at" \
+  "$doc select public.book_walk_in('$BRIGHT','Doc Walk-in','09171119999',
+     '$DR_BAUTISTA','Teeth Cleaning', now() + interval '95 days');"
 
 print "\n── RLS · assistant (front desk, D-Touch) ──────────────────────"
 expect_eq "sees D-Touch's 7 appointments" "$asst select count(*) from public.appointments;" 7
@@ -1634,8 +1637,15 @@ expect_err "an unknown sex value is refused" \
 expect_err_msg "the patient app does not register patients" \
   "$asst select public.register_patient('$DENTAL', $ANA, $INTAKE, 'patient_app');" \
   "join a clinic"
-expect_err "a doctor does not register patients" \
-  "$doc select public.register_patient('$DENTAL', $ANA, $INTAKE);"
+expect_eq "a doctor adds a patient, form and all" \
+  "begin; $doc create temp table t as select public.register_patient('$DENTAL', $ANA, $INTAKE) as id;
+   select pe.full_name || '|' || i.source from public.patients pt
+     join public.persons pe on pe.id = pt.person_id
+     join public.patient_intakes i on i.patient_id = pt.id
+    where pt.id = (select id from t);
+   rollback;" "Ana Cruz|staff"
+expect_err_msg "…but does not import them from a file" \
+  "$doc select public.start_import('$DENTAL', 'patients', 'x.csv');" "front desk"
 expect_err "nor does another clinic's admin, at this clinic" \
   "$bright select public.register_patient('$DENTAL', $ANA, $INTAKE);"
 expect_err "anon cannot register anyone" \
@@ -2068,6 +2078,120 @@ expect_eq "the patient list finds a chart by its number" \
    $asst select jsonb_array_length(r->'patients') || '|' || (r->'patients'->0->>'chart_number')
    from public.search_patients('$DENTAL', 'dt-0042') r; rollback;" "1|DT-0042"
 psql $CONN -c "delete from public.import_batches where id in ('$VBATCH', '$DBATCH'); delete from public.data_exports;" > /dev/null
+
+print "\n── Audit log ──────────────────────────────────────────────────"
+# Each check looks only at what its own transaction logged.
+THIS_TX="tx_id = txid_current()"
+expect_eq "adding a patient logs the chart with who they are, and the form, as the doctor" \
+  "begin; $doc select count(*) from (select public.register_patient('$DENTAL', $ANA, $INTAKE)) x; reset role;
+   select string_agg(table_name || ':' || action || ':' || actor_name || ':' || actor_role
+            || ':' || coalesce(new_values->'person'->>'full_name', '-'), ',' order by id)
+     from public.audit_log where $THIS_TX;
+   rollback;" \
+  $'1\npatients:insert:Maria Santos:doctor:Ana Cruz,patient_intakes:insert:Maria Santos:doctor:-'
+expect_eq "an update keeps only what changed" \
+  "begin; $asst update public.appointments set status='confirmed' where id='$A2'; reset role;
+   select action || '|' || (select string_agg(k, ',') from jsonb_object_keys(new_values) k)
+          || '|' || (old_values->>'status') || '>' || (new_values->>'status') || '|' || patient_id
+     from public.audit_log where $THIS_TX and table_name='appointments';
+   rollback;" "update|status|pending>confirmed|$PT_MARIA"
+expect_eq "bookkeeping alone (the reminder stamp) is not logged" \
+  "begin; update public.appointments set reminded_at=now() where id='$A2';
+   select count(*) from public.audit_log where $THIS_TX; rollback;" 0
+expect_eq "a note's old wording is kept" \
+  "begin; $dtadmin update public.visit_notes set body='Rewritten' where appointment_id='$A7'; reset role;
+   select (old_values->>'body' <> 'Rewritten') || '|' || (new_values->>'body') || '|' || patient_id
+     from public.audit_log where $THIS_TX;
+   rollback;" "true|Rewritten|$PT_MARIA"
+expect_eq "a deleted visit is kept whole" \
+  "begin; $dtadmin delete from public.appointments where id='$A2'; reset role;
+   select (old_values->>'status') || '|' || (old_values->>'patient_id') || '|' || (new_values is null)
+     from public.audit_log where $THIS_TX and table_name='appointments';
+   rollback;" "pending|$PT_MARIA|true"
+expect_eq "a shared person fixed by one clinic's desk is logged at that clinic only" \
+  "begin; $asst update public.persons set phone='0917 222 3333' where id='$PERSON_MARIA'; reset role;
+   select string_agg(clinic_id || ':' || patient_id || ':' || (new_values->>'phone'), ',')
+     from public.audit_log where $THIS_TX;
+   rollback;" "$DENTAL:$PT_MARIA:0917 222 3333"
+expect_eq "…and one the patient changed themself, at every clinic that treats them" \
+  "begin; $juan update public.persons set address='Pasig' where id='$PERSON_JUAN'; reset role;
+   select count(*) || '|' || string_agg(distinct actor_role, ',')
+     from public.audit_log where $THIS_TX;
+   rollback;" "3|patient"
+expect_eq "a change with no one signed in is the system's" \
+  "begin; reset request.jwt.claim.sub; update public.services set price=999 where clinic_id='$DENTAL' and name='Teeth Cleaning';
+   select count(*) filter (where actor_id is null) || '/' || count(*) from public.audit_log where $THIS_TX;
+   rollback;" "1/1"
+expect_eq "a staff code is never copied into the log" \
+  "begin; $dtadmin select (public.create_staff_invite('$DENTAL', 'doctor', 'x')).id is not null; reset role;
+   select count(*) from public.audit_log where $THIS_TX and (new_values ? 'code');
+   rollback;" $'t\n0'
+
+# Leave something in the log for the reading checks.
+psql $CONN -c "$dtadmin update public.services set price = price + 1 where clinic_id='$DENTAL' and name='Teeth Cleaning';
+               update public.services set price = price - 1 where clinic_id='$DENTAL' and name='Teeth Cleaning';" > /dev/null
+expect_eq "admins read their clinic's log" \
+  "$dtadmin select count(*) > 0 from public.audit_log where clinic_id='$DENTAL';" t
+expect_eq "…and no other clinic's" \
+  "$bright select count(*) from public.audit_log where clinic_id <> '$BRIGHT';" 0
+expect_eq "the apps' view names the patient" \
+  "begin; $dtadmin update public.chart_notes set body = body || '.' where patient_id='$PT_MARIA';
+   select patient_name from public.audit_entries where $THIS_TX; rollback;" "Maria Reyes"
+expect_eq "…even once the chart is gone" \
+  "begin; $asst create temp table t as select public.register_patient('$DENTAL', $ANA) as id;
+   reset role; delete from public.patients where id = (select id from t);
+   $dtadmin select string_agg(action || ':' || patient_name, ',' order by id)
+     from public.audit_entries where $THIS_TX and table_name = 'patients';
+   rollback;" "insert:Ana Cruz,delete:Ana Cruz"
+expect_eq "…and still only to admins" \
+  "$asst select count(*) from public.audit_entries;" 0
+expect_eq "the front desk reads none of it" "$asst select count(*) from public.audit_log;" 0
+expect_eq "nor do doctors" "$doc select count(*) from public.audit_log;" 0
+expect_eq "nor patients" "$juan select count(*) from public.audit_log;" 0
+expect_err "not even an admin can edit the log" \
+  "$dtadmin update public.audit_log set actor_name='Someone else';"
+expect_err "…or delete from it" \
+  "$dtadmin delete from public.audit_log;"
+expect_err "…or write to it" \
+  "$dtadmin insert into public.audit_log (clinic_id, table_name, row_id, action)
+   values ('$DENTAL', 'patients', 'x', 'insert');"
+
+print "\n── Privacy Policy and Terms (RA 10173) ────────────────────────"
+PRIVACY_AUTH='aaaaaaaa-0000-0000-0000-00000000000a'
+SLOPPY_AUTH='aaaaaaaa-0000-0000-0000-00000000000b'
+expect_eq "accounts made without versions have no acknowledgement" \
+  "select count(*) from public.policy_acknowledgements;" 0
+expect_eq "a sign-up that ticked the box records both documents' versions" \
+  "begin; insert into auth.users (id,email,raw_user_meta_data) values
+     ('$PRIVACY_AUTH','privacy@mail.com','{\"full_name\":\"Pia Cruz\",\"privacy_policy_version\":\"2026-09-30\",\"terms_version\":\"2026-09-29\"}');
+   select string_agg(document || ':' || version || ':' || source, ',' order by document)
+     from public.policy_acknowledgements where profile_id='$PRIVACY_AUTH'; rollback;" \
+  "privacy:2026-09-30:sign_up,terms:2026-09-29:sign_up"
+expect_eq "a malformed version still signs up, and records only what is well-formed" \
+  "begin; insert into auth.users (id,email,raw_user_meta_data) values
+     ('$SLOPPY_AUTH','sloppy@mail.com','{\"privacy_policy_version\":\"yes\",\"terms_version\":\"2026-09-30\"}');
+   select (select count(*) from public.profiles where id='$SLOPPY_AUTH') || '|' ||
+          (select string_agg(document, ',') from public.policy_acknowledgements where profile_id='$SLOPPY_AUTH');
+   rollback;" "1|terms"
+expect_eq "an existing account acknowledges from the app, once per version" \
+  "begin; $newbie select public.acknowledge_policy('privacy', '2026-09-30');
+   select public.acknowledge_policy('privacy', '2026-09-30');
+   select count(*) || '|' || min(source) from public.policy_acknowledgements; rollback;" \
+  $'\n\n1|app'
+expect_err "…only a real version" \
+  "$newbie select public.acknowledge_policy('privacy', 'latest');"
+expect_err "…of a real document" \
+  "$newbie select public.acknowledge_policy('cookies', '2026-09-30');"
+expect_err "…and only when signed in" \
+  "$anon select public.acknowledge_policy('terms', '2026-09-30');"
+expect_eq "each person reads only their own" \
+  "begin; $newbie select public.acknowledge_policy('terms', '2026-09-30');
+   $juan select count(*) from public.policy_acknowledgements; rollback;" $'\n0'
+expect_err "nobody writes one directly" \
+  "$juan insert into public.policy_acknowledgements (profile_id, document, version, source)
+   values ('$JUAN_AUTH', 'terms', '2026-09-30', 'app');"
+expect_err "…or rewrites one" \
+  "$newbie update public.policy_acknowledgements set acknowledged_at = now() - interval '1 year';"
 
 print "\n── RLS coverage ───────────────────────────────────────────────"
 expect_eq "no public table left without RLS" \
